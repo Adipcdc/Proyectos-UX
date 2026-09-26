@@ -576,6 +576,7 @@ var PERSON_PALETTE = ['#5B8DEF','#E0A354','#4FB286','#C77DC0','#E2725B','#4FA8C9
 
 var dbCap = null;
 var usingLocal = false;
+var pendingExpensePhoto = null; /* dataURL de la foto elegida para el próximo gasto a guardar */
 
 /* ================= Utilities ================= */
 function uid(){ return 'l' + Date.now().toString(36) + Math.random().toString(36).slice(2,8); }
@@ -607,6 +608,39 @@ function fmtMoney(n, cur){
   return sign + (cur==='USD' ? '$' : '$') + s + (cur==='USD' ? ' USD' : '');
 }
 function esc(s){ return (s==null?'':String(s)).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+/* Comprime una foto (ticket/nota sin factura) a un data URL JPEG que quepa
+   cómodamente dentro del límite de 1 MB por documento de Firestore/db. Baja
+   resolución y calidad en pasos hasta que el resultado sea razonablemente
+   chico; si ni así cabe, rechaza para que la UI avise en vez de guardar
+   algo que luego falle al sincronizar. */
+function compressImageFile(file){
+  return new Promise(function(resolve, reject){
+    var reader = new FileReader();
+    reader.onerror = function(){ reject(new Error('read_failed')); };
+    reader.onload = function(){
+      var img = new Image();
+      img.onerror = function(){ reject(new Error('decode_failed')); };
+      img.onload = function(){
+        var steps = [[1400,0.72],[1200,0.55],[1000,0.42],[800,0.32],[650,0.25]];
+        var dataUrl = null;
+        for(var i=0;i<steps.length;i++){
+          var maxDim = steps[i][0], quality = steps[i][1];
+          var scale = Math.min(1, maxDim/Math.max(img.width, img.height));
+          var cw = Math.max(1, Math.round(img.width*scale)), ch = Math.max(1, Math.round(img.height*scale));
+          var canvas = document.createElement('canvas');
+          canvas.width = cw; canvas.height = ch;
+          canvas.getContext('2d').drawImage(img, 0, 0, cw, ch);
+          dataUrl = canvas.toDataURL('image/jpeg', quality);
+          if(dataUrl.length <= 700000) break;
+        }
+        if(!dataUrl || dataUrl.length > 950000){ reject(new Error('too_large')); return; }
+        resolve(dataUrl);
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
 function byId(arr, id){ return arr.filter(function(x){ return x.id===id; })[0] || null; }
 function activeProjects(){ return state.projects.filter(function(p){ return !p.archived; }).sort(function(a,b){ return (a.createdAt||'').localeCompare(b.createdAt||''); }); }
 function selectedProject(){ return byId(state.projects, state.selectedProjectId); }
@@ -757,10 +791,10 @@ function initStore(){
 function exportProjectCSV(project){
   var rows = state.expenses.filter(function(e){ return e.projectId===project.id; })
     .sort(function(a,b){ return a.date.localeCompare(b.date); });
-  var lines = ['Fecha,Categoria,Moneda,Monto,TipoCambio,MontoMXN,Nota'];
+  var lines = ['Fecha,Categoria,Moneda,Monto,TipoCambio,MontoMXN,Nota,TieneFoto'];
   rows.forEach(function(e){
     var note = (e.note||'').replace(/"/g,'""');
-    lines.push([e.date, '"'+(e.category||'')+'"', e.currency, e.amount, e.fx||1, (e.mxn||0).toFixed(2), '"'+note+'"'].join(','));
+    lines.push([e.date, '"'+(e.category||'')+'"', e.currency, e.amount, e.fx||1, (e.mxn||0).toFixed(2), '"'+note+'"', e.photo?'Si':'No'].join(','));
   });
   var csv = lines.join('\n');
   var filename = 'Gastos_'+project.name.replace(/[^a-z0-9]+/gi,'_')+'.csv';
@@ -963,6 +997,162 @@ function exportHoursXLSX(project){
   }).catch(function(err){ console.error(err); alertBanner('No se pudo generar el archivo de Excel.'); });
 }
 
+/* ================= Excel export: gastos (con fotos de tickets) ================= */
+/* Lee las dimensiones naturales de una imagen a partir de su data URL, para
+   poder dimensionar proporcionalmente cada foto antes de insertarla en la
+   hoja de Excel (ExcelJS necesita el ancho/alto en el momento de llamar a
+   worksheet.addImage, así que esto se resuelve todo por adelantado con
+   Promise.all antes de construir el libro de forma síncrona). */
+function getImageDims(dataUrl){
+  return new Promise(function(resolve){
+    try{
+      var img = new Image();
+      img.onload = function(){ resolve({ w: img.naturalWidth||400, h: img.naturalHeight||300 }); };
+      img.onerror = function(){ resolve({ w:400, h:300 }); };
+      img.src = dataUrl;
+    }catch(e){ resolve({ w:400, h:300 }); }
+  });
+}
+function exportGastosXLSX(project){
+  if(typeof ExcelJS==='undefined'){ alertBanner('No se pudo cargar el generador de Excel (revisa tu conexión).'); return; }
+  var rows = state.expenses.filter(function(e){ return e.projectId===project.id; })
+    .sort(function(a,b){ return a.date.localeCompare(b.date); });
+  if(!rows.length){ alertBanner('Este proyecto no tiene gastos registrados.'); return; }
+
+  /* Agrupa por semana ISO, igual que Detalle de horas, para el subtotal. */
+  var weeks = {};
+  rows.forEach(function(e){
+    var d = parseISODate(e.date);
+    var mon = mondayOf(d);
+    var key = toISODate(mon);
+    if(!weeks[key]) weeks[key] = { monday: mon, sunday: addDays(mon,6), weekNum: isoWeekNumber(mon), entries: [] };
+    weeks[key].entries.push(e);
+  });
+  var weekKeys = Object.keys(weeks).sort();
+
+  var withPhoto = rows.filter(function(e){ return !!e.photo; });
+
+  /* Resuelve las dimensiones de todas las fotos ANTES de construir el
+     workbook, porque ExcelJS no es asíncrono: no se pueden intercalar
+     llamadas await entre addRow/addImage sin arriesgar el orden de filas. */
+  Promise.all(withPhoto.map(function(e){ return getImageDims(e.photo); })).then(function(dimsList){
+    var wb = new ExcelJS.Workbook();
+    wb.creator = 'Viáticos UX';
+    wb.created = new Date();
+
+    /* ---- Hoja 1: Detalle de gastos, con subtotal al cierre de cada semana ---- */
+    var det = wb.addWorksheet('Detalle de gastos');
+    var detCols = [
+      { key:'week', width:9 }, { key:'day', width:10 }, { key:'date', width:13 },
+      { key:'category', width:22 }, { key:'currency', width:9 }, { key:'amount', width:12 },
+      { key:'fx', width:9 }, { key:'mxn', width:13 }, { key:'note', width:30 }, { key:'photo', width:10 }
+    ];
+    det.columns = detCols;
+    addSheetHeader(det, detCols.length, project, 'DETALLE DE GASTOS POR SEMANA');
+    var detHeaderRow = det.addRow({ week:'Semana', day:'Día', date:'Fecha', category:'Categoría', currency:'Moneda', amount:'Monto', fx:'T/C', mxn:'Monto MXN', note:'Nota', photo:'Foto' });
+    styleColumnHeaderRow(detHeaderRow, detCols.length);
+
+    var grandTotalMXN = 0;
+    weekKeys.forEach(function(key){
+      var wk = weeks[key];
+      var list = wk.entries.slice().sort(function(a,b){ return a.date.localeCompare(b.date); });
+      list.forEach(function(e){
+        var d = parseISODate(e.date);
+        var dayName = WEEKDAYS[(d.getDay()+6)%7];
+        var row = det.addRow({
+          week: wk.weekNum, day: dayName, date: e.date,
+          category: e.category||'', currency: e.currency||'MXN',
+          amount: e.amount||0, fx: e.fx||1, mxn: e.mxn||0,
+          note: e.note||'', photo: e.photo ? 'Ver hoja Fotos' : ''
+        });
+        row.getCell('amount').numFmt = '#,##0.00';
+        row.getCell('mxn').numFmt = '#,##0.00';
+        if(e.photo) row.getCell('photo').font = { italic:true, color:{argb:'FF1F3864'} };
+      });
+      var totalMXN = list.reduce(function(a,e){ return a+(e.mxn||0); }, 0);
+      grandTotalMXN += totalMXN;
+      var totalRow = det.addRow({ note:'Total semana '+wk.weekNum+':', mxn: totalMXN });
+      totalRow.font = { bold:true };
+      totalRow.getCell('mxn').numFmt = '#,##0.00';
+      totalRow.eachCell({ includeEmpty:true }, function(cell){
+        cell.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XLS_TOTAL_TINT} };
+        cell.border = { top:{style:'thin', color:{argb:'FFAAAAAA'}} };
+      });
+    });
+    var grandRowDet = det.addRow({ note:'TOTAL GENERAL:', mxn: grandTotalMXN });
+    grandRowDet.font = { bold:true };
+    grandRowDet.getCell('mxn').numFmt = '#,##0.00';
+    grandRowDet.eachCell({ includeEmpty:true }, function(cell){ cell.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XLS_TOTAL_TINT} }; });
+    det.views = [{ state:'frozen', ySplit:6 }];
+
+    /* ---- Hoja 2: Resumen semanal ---- */
+    var sum = wb.addWorksheet('Resumen semanal');
+    var sumCols = [ { key:'week', width:9 }, { key:'from', width:13 }, { key:'to', width:13 }, { key:'total', width:16 } ];
+    sum.columns = sumCols;
+    addSheetHeader(sum, sumCols.length, project, 'RESUMEN SEMANAL DE GASTOS');
+    var sumHeaderRow = sum.addRow({ week:'Semana', from:'Del', to:'Al', total:'Total MXN' });
+    styleColumnHeaderRow(sumHeaderRow, sumCols.length);
+    weekKeys.forEach(function(key){
+      var wk = weeks[key];
+      var totalMXN = wk.entries.reduce(function(a,e){ return a+(e.mxn||0); }, 0);
+      var r = sum.addRow({ week: wk.weekNum, from: toISODate(wk.monday), to: toISODate(wk.sunday), total: totalMXN });
+      r.getCell('total').numFmt = '#,##0.00';
+      r.getCell('total').font = { bold:true };
+    });
+    var grandRowSum = sum.addRow({ to:'TOTAL GENERAL', total: grandTotalMXN });
+    grandRowSum.font = { bold:true };
+    grandRowSum.getCell('total').numFmt = '#,##0.00';
+    grandRowSum.eachCell({ includeEmpty:true }, function(cell){ cell.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XLS_TOTAL_TINT} }; });
+    sum.views = [{ state:'frozen', ySplit:6 }];
+
+    /* ---- Hoja 3: Fotos de tickets/notas, una debajo de otra con su ficha ---- */
+    if(withPhoto.length){
+      var pic = wb.addWorksheet('Fotos');
+      pic.columns = [ { key:'a', width:80 } ];
+      addSheetHeader(pic, 1, project, 'TICKETS Y NOTAS (SIN FACTURA)');
+      var picHeaderRow = pic.addRow({ a:'Comprobante' });
+      styleColumnHeaderRow(picHeaderRow, 1);
+
+      var sortedPhotoIdx = withPhoto.map(function(e,i){ return i; })
+        .sort(function(i,j){ return withPhoto[i].date.localeCompare(withPhoto[j].date); });
+
+      sortedPhotoIdx.forEach(function(i){
+        var e = withPhoto[i];
+        var dims = dimsList[i];
+        /* Ficha de texto: fecha, categoría, monto, nota. */
+        var caption = e.date+'   ·   '+(e.category||'')+'   ·   '+
+          (e.amount||0)+' '+(e.currency||'MXN')+(e.fx&&e.fx!==1 ? ' (T/C '+e.fx+', '+(e.mxn||0).toFixed(2)+' MXN)' : '') +
+          (e.note ? '   ·   '+e.note : '');
+        var capRow = pic.addRow({ a: caption });
+        capRow.font = { bold:true, size:10.5 };
+        capRow.getCell(1).fill = { type:'pattern', pattern:'solid', fgColor:{argb:'FFF2F2F2'} };
+
+        /* Escala la imagen a un ancho fijo manteniendo proporción, para que
+           quepa cómoda en la columna sin distorsionarse. */
+        var targetW = 480;
+        var scale = targetW / (dims.w||400);
+        var targetH = Math.round((dims.h||300) * scale);
+        var m = /^data:image\/(\w+);base64,/.exec(e.photo||'');
+        var ext = (m && m[1]==='jpeg') ? 'jpeg' : (m ? m[1] : 'jpeg');
+        if(ext!=='png' && ext!=='jpeg' && ext!=='gif') ext = 'jpeg';
+        var imgId = wb.addImage({ base64: e.photo, extension: ext });
+        var imgRowIndex = pic.rowCount; /* fila justo debajo de la ficha, 0-based para addImage */
+        var rowsForImage = Math.max(2, Math.ceil(targetH/20));
+        for(var r=0;r<rowsForImage;r++) pic.addRow([]);
+        pic.addImage(imgId, { tl:{ col:0.1, row: imgRowIndex + 0.1 }, ext:{ width: targetW, height: targetH } });
+        pic.addRow([]); /* espacio entre comprobantes */
+      });
+      pic.views = [{ state:'frozen', ySplit:6 }];
+    }
+
+    wb.xlsx.writeBuffer().then(function(buffer){
+      var blob = new Blob([buffer], { type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      var filename = 'Gastos_'+project.name.replace(/[^a-z0-9]+/gi,'_')+'.xlsx';
+      downloadBlobFile(blob, filename);
+    }).catch(function(err){ console.error(err); alertBanner('No se pudo generar el archivo de Excel.'); });
+  }).catch(function(err){ console.error(err); alertBanner('No se pudo generar el archivo de Excel.'); });
+}
+
 var bannerTimeout=null;
 function alertBanner(msg){
   var el = document.getElementById('flashBanner');
@@ -1070,6 +1260,12 @@ function renderGastos(){
   }
 
   html += '<div class="field" style="margin-top:10px;"><label>Nota (opcional)</label><input class="input" type="text" id="expNote" placeholder="Ej. Ticket Pemex #4471" maxlength="140"></div>';
+  html += '<div class="field" style="margin-top:10px;"><label>Foto del ticket/nota (opcional, cuando no hay factura)</label><input class="input" type="file" accept="image/*" id="expPhotoInput"></div>';
+  html += '<div id="expPhotoPreviewWrap" style="'+(pendingExpensePhoto?'':'display:none;')+'margin-top:8px;">';
+  html += '<img id="expPhotoPreview" src="'+(pendingExpensePhoto||'')+'" style="max-width:100%;max-height:160px;border-radius:8px;border:1px solid var(--border);display:block;">';
+  html += '<button type="button" class="btn sm ghost" id="expPhotoClearBtn" style="margin-top:6px;">Quitar foto</button>';
+  html += '</div>';
+  html += '<div class="hint" id="expPhotoHint" style="margin-top:6px;"></div>';
   html += '<button class="btn accent block" style="margin-top:14px;" id="saveExpenseBtn">Guardar gasto</button>';
   html += '</div>';
 
@@ -1083,7 +1279,7 @@ function renderGastos(){
       var d = parseISODate(e.date);
       html += '<div class="row-item" data-edit-expense="'+e.id+'">';
       html += '<div class="row-date"><div class="d">'+pad2(d.getDate())+'</div><div class="m">'+MONTHS[d.getMonth()]+'</div></div>';
-      html += '<div class="row-mid"><div class="cat">'+esc(canonicalCategory(e.category))+'</div>'+(e.note?'<div class="note">'+esc(e.note)+'</div>':'')+'</div>';
+      html += '<div class="row-mid"><div class="cat">'+esc(canonicalCategory(e.category))+(e.photo?' <span title="Tiene foto adjunta" style="font-size:12px;">📷</span>':'')+'</div>'+(e.note?'<div class="note">'+esc(e.note)+'</div>':'')+'</div>';
       html += '<div class="row-amt"><div class="a">'+fmtMoney(e.currency==='USD'?e.amount:e.mxn, e.currency==='USD'?'USD':'MXN')+'</div>'+(e.currency==='USD'?'<div class="c">≈ $'+(e.mxn||0).toLocaleString('es-MX',{minimumFractionDigits:2,maximumFractionDigits:2})+' MXN</div>':'<div class="c">MXN</div>')+'</div>';
       html += '</div>';
     });
@@ -1209,6 +1405,7 @@ function renderHoras(){
   html += '<div id="hrsAddPersonRow" style="display:none;margin-top:8px;" class="field-row"><input class="input" type="text" id="hrsNewPersonInput" placeholder="Nombre" style="flex:1;"><button class="btn sm" type="button" id="hrsAddPersonBtn">Añadir</button></div>';
   if(people.length>1){
     html += '<button class="btn sm ghost" type="button" data-open-modal="copyHours" data-project="'+p.id+'" style="margin-top:8px;">Copiar horas entre personas</button>';
+    html += '<button class="btn sm ghost" type="button" data-open-modal="removePerson" data-project="'+p.id+'" style="margin-top:6px;">Quitar una persona del proyecto</button>';
   }
   html += '</div>';
 
@@ -1319,6 +1516,7 @@ function renderResumen(){
     html += '<button class="btn sm" data-open-modal="viewAdvances" data-project="'+p.id+'">Ver abonos ('+advances.length+')</button>';
     html += '<button class="btn sm" data-open-modal="editProject" data-project="'+p.id+'">Editar</button>';
     html += '<button class="btn sm" data-export-csv="'+p.id+'">Exportar CSV</button>';
+    html += '<button class="btn sm" data-export-gastos-xlsx="'+p.id+'">Exportar gastos (Excel)</button>';
     html += '<button class="btn sm" data-export-hours="'+p.id+'">Exportar horas (Excel)</button>';
     html += '</div></div>';
   });
@@ -1349,6 +1547,7 @@ function openModal(name, opts){
   else if(name==='editExpense') html = modalExpenseForm(byId(state.expenses, opts.expense));
   else if(name==='editHours') html = modalHoursForm(byId(state.hours, opts.hours));
   else if(name==='copyHours') html = modalCopyHoursForm(byId(state.projects, opts.project));
+  else if(name==='removePerson') html = modalRemovePersonForm(byId(state.projects, opts.project));
   root.innerHTML = '<div class="modal-overlay" id="modalOverlay"><div class="modal-sheet" id="modalSheet"></div></div>';
   document.getElementById('modalSheet').innerHTML = html;
   document.getElementById('modalOverlay').addEventListener('click', function(e){
@@ -1468,6 +1667,16 @@ function modalExpenseForm(expense){
   html += '<div class="field" id="eeFxWrap" style="'+(cur==='USD'?'':'display:none;')+'"><label>T/C</label><input class="input num" type="number" step="0.0001" min="0" id="eeFx" value="'+(expense.fx||17.3)+'"></div>';
   html += '</div>';
   html += '<div class="field" style="margin-top:10px;"><label>Nota</label><input class="input" type="text" id="eeNote" value="'+esc(expense.note||'')+'" maxlength="140"></div>';
+  html += '<div class="field" style="margin-top:10px;"><label>Foto del ticket/nota</label>';
+  if(expense.photo){
+    html += '<img id="eePhotoPreview" src="'+expense.photo+'" style="max-width:100%;max-height:220px;border-radius:8px;border:1px solid var(--border);display:block;margin-bottom:6px;">';
+    html += '<button type="button" class="btn sm ghost" id="eePhotoRemoveBtn">Quitar foto</button>';
+  } else {
+    html += '<input class="input" type="file" accept="image/*" id="eePhotoInput">';
+    html += '<div id="eePhotoPreviewWrap" style="display:none;margin-top:6px;"><img id="eePhotoPreview" style="max-width:100%;max-height:220px;border-radius:8px;border:1px solid var(--border);display:block;"></div>';
+  }
+  html += '<div class="hint" id="eePhotoHint" style="margin-top:6px;"></div>';
+  html += '</div>';
   html += '<button class="btn accent block" style="margin-top:16px;" id="eeSaveBtn" data-id="'+expense.id+'">Guardar cambios</button>';
   html += '<button class="btn danger block" style="margin-top:10px;" id="eeDeleteBtn" data-id="'+expense.id+'">Eliminar gasto</button>';
   return html;
@@ -1508,6 +1717,16 @@ function modalCopyHoursForm(project){
   html += '<div class="chip" data-cph-scope="all">Todo el historial de este proyecto</div>';
   html += '</div></div>';
   html += '<button class="btn accent block" style="margin-top:16px;" id="cphSaveBtn" data-project="'+project.id+'">Copiar horas</button>';
+  return html;
+}
+function modalRemovePersonForm(project){
+  if(!project) return '';
+  var people = peopleFor(project);
+  var html = '<div class="modal-head"><h2>Quitar persona del proyecto</h2><button class="modal-close" data-close-modal="1">✕</button></div>';
+  html += '<div class="field"><label>Persona a quitar</label><select class="input" id="rpPerson">'+people.map(function(nm){ return '<option value="'+esc(nm)+'">'+esc(nm)+'</option>'; }).join('')+'</select></div>';
+  html += '<div class="hint" id="rpWarning" style="margin-top:8px;"></div>';
+  html += '<label style="display:flex;align-items:center;gap:7px;margin-top:10px;font-size:12.5px;color:var(--text-muted);"><input type="checkbox" id="rpDeleteHours"> Eliminar también sus horas ya registradas en este proyecto</label>';
+  html += '<button class="btn danger block" style="margin-top:16px;" id="rpConfirmBtn" data-project="'+project.id+'">Quitar persona</button>';
   return html;
 }
 
@@ -1696,6 +1915,48 @@ function bindModalEvents(name, opts){
         document.getElementById('eeFxWrap').style.display = b.getAttribute('data-cur')==='USD' ? '' : 'none';
       });
     });
+    var expenseForPhoto = byId(state.expenses, opts.expense);
+    var pendingEePhoto = expenseForPhoto ? (expenseForPhoto.photo || null) : null;
+    function bindEePhotoInput(){
+      var input = document.getElementById('eePhotoInput');
+      if(!input) return;
+      input.addEventListener('change', function(){
+        var file = input.files && input.files[0];
+        if(!file) return;
+        var hint = document.getElementById('eePhotoHint');
+        if(hint) hint.textContent = 'Procesando foto…';
+        compressImageFile(file).then(function(dataUrl){
+          pendingEePhoto = dataUrl;
+          var wrap = document.getElementById('eePhotoPreviewWrap');
+          var img = document.getElementById('eePhotoPreview');
+          if(img) img.src = dataUrl;
+          if(wrap) wrap.style.display = '';
+          if(hint) hint.textContent = '';
+        }).catch(function(){
+          if(hint) hint.textContent = 'No se pudo procesar esa foto, intenta con otra.';
+        });
+      });
+    }
+    bindEePhotoInput();
+    var eePhotoRemoveBtn = document.getElementById('eePhotoRemoveBtn');
+    if(eePhotoRemoveBtn){
+      eePhotoRemoveBtn.addEventListener('click', function(){
+        pendingEePhoto = null;
+        var field = eePhotoRemoveBtn.closest('.field');
+        var img = document.getElementById('eePhotoPreview');
+        if(img) img.remove();
+        eePhotoRemoveBtn.remove();
+        var input = document.createElement('input');
+        input.className = 'input'; input.type = 'file'; input.accept = 'image/*'; input.id = 'eePhotoInput';
+        var wrap = document.createElement('div');
+        wrap.id = 'eePhotoPreviewWrap'; wrap.style.marginTop = '6px'; wrap.style.display = 'none';
+        wrap.innerHTML = '<img id="eePhotoPreview" style="max-width:100%;max-height:220px;border-radius:8px;border:1px solid var(--border);display:block;">';
+        var hintEl = document.getElementById('eePhotoHint');
+        field.insertBefore(input, hintEl);
+        field.insertBefore(wrap, hintEl);
+        bindEePhotoInput();
+      });
+    }
     document.getElementById('eeSaveBtn').addEventListener('click', function(){
       var id = document.getElementById('eeSaveBtn').getAttribute('data-id');
       var cur = curSeg.querySelector('button.active').getAttribute('data-cur');
@@ -1706,7 +1967,8 @@ function bindModalEvents(name, opts){
         date: document.getElementById('eeDate').value,
         category: document.getElementById('eeCategory').value,
         currency: cur, amount: amount, fx: fx, mxn: mxn,
-        note: document.getElementById('eeNote').value.trim()
+        note: document.getElementById('eeNote').value.trim(),
+        photo: pendingEePhoto
       }).then(closeModal);
     });
     document.getElementById('eeDeleteBtn').addEventListener('click', function(){
@@ -1796,6 +2058,49 @@ function bindModalEvents(name, opts){
       });
     });
   }
+  else if(name==='removePerson'){
+    var rpSelect = document.getElementById('rpPerson');
+    var rpWarning = document.getElementById('rpWarning');
+    function rpUpdateWarning(){
+      var proj = byId(state.projects, opts.project);
+      var peeps = peopleFor(proj);
+      var nm = rpSelect.value;
+      var count = state.hours.filter(function(h){ return h.projectId===opts.project && (h.person||peeps[0])===nm; }).length;
+      rpWarning.textContent = count>0
+        ? (nm+' tiene '+count+' registro(s) de horas en este proyecto. Si no marcas la casilla de abajo, esas horas se conservan pero quedan guardadas con el nombre "'+nm+'".')
+        : (nm+' no tiene horas registradas todavía en este proyecto.');
+    }
+    rpSelect.addEventListener('change', rpUpdateWarning);
+    rpUpdateWarning();
+    document.getElementById('rpConfirmBtn').addEventListener('click', function(){
+      var btn = this;
+      if(btn.disabled) return;
+      var pid = btn.getAttribute('data-project');
+      var proj = byId(state.projects, pid);
+      if(!proj) return;
+      var nm = rpSelect.value;
+      var peeps = peopleFor(proj);
+      var deleteHours = document.getElementById('rpDeleteHours').checked;
+      var remaining = peeps.filter(function(x){ return x!==nm; });
+      btn.disabled = true;
+      btn.textContent = 'Quitando…';
+      var chain = updateRecord('projects', pid, { people: remaining });
+      if(deleteHours){
+        var toDelete = state.hours.filter(function(h){ return h.projectId===pid && (h.person||peeps[0])===nm; });
+        chain = chain.then(function(){ return Promise.all(toDelete.map(function(h){ return deleteRecord('hours', h.id); })); });
+      }
+      chain.then(function(){
+        if(state.hoursPersonFilter===nm) state.hoursPersonFilter = 'all';
+        alertBanner('Se quitó a '+nm+' del proyecto.');
+        closeModal(); render();
+      }).catch(function(err){
+        console.error(err);
+        alertBanner('No se pudo quitar a la persona.');
+        btn.disabled = false;
+        btn.textContent = 'Quitar persona';
+      });
+    });
+  }
 }
 function bindCatRemovers(){
   document.querySelectorAll('[data-remove-cat]').forEach(function(b){
@@ -1822,10 +2127,10 @@ document.addEventListener('click', function(e){
   var t = e.target;
 
   var tabBtn = t.closest('.nav-btn');
-  if(tabBtn){ state.currentTab = tabBtn.getAttribute('data-tab'); render(); return; }
+  if(tabBtn){ state.currentTab = tabBtn.getAttribute('data-tab'); pendingExpensePhoto = null; render(); return; }
 
   var chip = t.closest('[data-select-project]');
-  if(chip){ state.selectedProjectId = chip.getAttribute('data-select-project'); render(); return; }
+  if(chip){ state.selectedProjectId = chip.getAttribute('data-select-project'); pendingExpensePhoto = null; render(); return; }
 
   var modalOpener = t.closest('[data-open-modal]');
   if(modalOpener){
@@ -1873,6 +2178,16 @@ document.addEventListener('click', function(e){
   var hrsRow = t.closest('[data-edit-hours]');
   if(hrsRow){ openModal('editHours', { hours: hrsRow.getAttribute('data-edit-hours') }); return; }
 
+  var expPhotoClear = t.closest('#expPhotoClearBtn');
+  if(expPhotoClear){
+    pendingExpensePhoto = null;
+    var wrap = document.getElementById('expPhotoPreviewWrap');
+    if(wrap) wrap.style.display = 'none';
+    var input = document.getElementById('expPhotoInput');
+    if(input) input.value = '';
+    return;
+  }
+
   var saveExp = t.closest('#saveExpenseBtn');
   if(saveExp){
     var p = selectedProject();
@@ -1887,11 +2202,13 @@ document.addEventListener('click', function(e){
       date: document.getElementById('expDate').value || todayISO(),
       category: document.getElementById('expCategory').value,
       currency: cur, amount: amount, fx: fx, mxn: mxn,
-      note: document.getElementById('expNote').value.trim()
+      note: document.getElementById('expNote').value.trim(),
+      photo: pendingExpensePhoto
     }).then(function(){
       if(cur==='USD') updateRecord('projects', p.id, {lastFx: fx});
       alertBanner('Gasto guardado.');
       state.expenseCurrency='MXN';
+      pendingExpensePhoto = null;
       render();
     });
     return;
@@ -1930,6 +2247,13 @@ document.addEventListener('click', function(e){
     return;
   }
 
+  var exportGastosXlsxBtn = t.closest('[data-export-gastos-xlsx]');
+  if(exportGastosXlsxBtn){
+    var projG = byId(state.projects, exportGastosXlsxBtn.getAttribute('data-export-gastos-xlsx'));
+    if(projG) exportGastosXLSX(projG);
+    return;
+  }
+
   var unarchiveBtn = t.closest('[data-unarchive]');
   if(unarchiveBtn){
     updateRecord('projects', unarchiveBtn.getAttribute('data-unarchive'), {archived:false});
@@ -1939,6 +2263,22 @@ document.addEventListener('click', function(e){
 
 document.addEventListener('change', function(e){
   if(e.target.id==='hrsManualToggle'){ state.hoursManual = e.target.checked; render(); }
+  if(e.target.id==='expPhotoInput'){
+    var file = e.target.files && e.target.files[0];
+    if(!file) return;
+    var hint = document.getElementById('expPhotoHint');
+    if(hint) hint.textContent = 'Procesando foto…';
+    compressImageFile(file).then(function(dataUrl){
+      pendingExpensePhoto = dataUrl;
+      var wrap = document.getElementById('expPhotoPreviewWrap');
+      var img = document.getElementById('expPhotoPreview');
+      if(img) img.src = dataUrl;
+      if(wrap) wrap.style.display = '';
+      if(hint) hint.textContent = '';
+    }).catch(function(){
+      if(hint) hint.textContent = 'No se pudo procesar esa foto (muy grande o formato no soportado); intenta con otra o tómala con menor resolución.';
+    });
+  }
 });
 
 document.addEventListener('input', function(e){
