@@ -494,6 +494,36 @@ table.pivot td.zero{ color:var(--text-faint); }
 
 <div id="modalRoot"></div>
 
+<!-- Firebase (solo se usa fuera de Claude, en el despliegue independiente / GitHub Pages;
+     dentro del artifact de Claude estos scripts simplemente no se usan). -->
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+
+<script>
+/* ============ Config de Firebase (edita esto con tus propios valores) ============
+   Consíguelos en: Firebase Console → ⚙️ Configuración del proyecto → tus apps → Config
+   Si lo dejas como null, la app sigue funcionando en modo "solo este dispositivo". */
+var FIREBASE_CONFIG = {
+  apiKey: "AIzaSyBnm3lZOj3rnhWeoWFFeHZRX-eqeCsiFpM",
+  authDomain: "gestionproy-ux.firebaseapp.com",
+  projectId: "gestionproy-ux",
+  storageBucket: "gestionproy-ux.firebasestorage.app",
+  messagingSenderId: "10218643464",
+  appId: "1:10218643464:web:5c9c3f2ad3aad53987f1bd"
+};
+/* Ejemplo (referencia, ya no aplica):
+var FIREBASE_CONFIG = {
+  apiKey: "AIzaSy...",
+  authDomain: "tu-proyecto.firebaseapp.com",
+  projectId: "tu-proyecto",
+  storageBucket: "tu-proyecto.appspot.com",
+  messagingSenderId: "123456789",
+  appId: "1:123456789:web:abcdef"
+};
+*/
+</script>
+
 <script>
 (function(){
 "use strict";
@@ -656,22 +686,39 @@ function initStore(){
     if(lbl) lbl.textContent = 'Solo en este dispositivo';
     subscribeAll();
   };
+  var goSynced = function(cap, label){
+    dbCap = cap;
+    usingLocal = false;
+    var pill = document.getElementById('syncDot');
+    var lbl = document.getElementById('syncLabel');
+    if(pill) pill.classList.remove('local');
+    if(lbl) lbl.textContent = label || 'Sincronizado';
+    subscribeAll();
+  };
+  /* Fuera de Claude: si hay config de Firebase, usarla como base de datos
+     compartida en la nube (misma API que la capability db.collection(...),
+     así que subscribeAll/addRecord/updateRecord/deleteRecord no cambian). */
+  var tryFirebase = function(){
+    if(!FIREBASE_CONFIG || typeof firebase==='undefined'){ goLocal(); return; }
+    try{
+      var app = firebase.apps && firebase.apps.length ? firebase.apps[0] : firebase.initializeApp(FIREBASE_CONFIG);
+      var auth = firebase.auth();
+      auth.onAuthStateChanged(function(user){
+        if(user){ goSynced(firebase.firestore(), 'Sincronizado (Firebase)'); }
+      });
+      auth.signInAnonymously().catch(function(err){ console.error('firebase auth', err); goLocal(); });
+      setTimeout(function(){ if(!state.loaded.projects && !dbCap) goLocal(); }, 6000);
+    }catch(e){ console.error('firebase init', e); goLocal(); }
+  };
   try{
     if(window.claude && window.claude.use){
       window.claude.use('db').then(function(cap){
-        if(cap){
-          dbCap = cap;
-          usingLocal = false;
-          var lbl = document.getElementById('syncLabel');
-          if(lbl) lbl.textContent = 'Sincronizado';
-          subscribeAll();
-        } else {
-          goLocal();
-        }
+        if(cap){ goSynced(cap, 'Sincronizado'); }
+        else { goLocal(); }
       }).catch(function(){ goLocal(); });
       setTimeout(function(){ if(!state.loaded.projects && !dbCap) goLocal(); }, 4000);
     } else {
-      goLocal();
+      tryFirebase();
     }
   }catch(e){ goLocal(); }
 }
@@ -1096,10 +1143,10 @@ function openModal(name, opts){
   else if(name==='viewAdvances') html = modalViewAdvances(opts.project);
   else if(name==='editExpense') html = modalExpenseForm(byId(state.expenses, opts.expense));
   else if(name==='editHours') html = modalHoursForm(byId(state.hours, opts.hours));
-  root.innerHTML = '<div class="modal-overlay" data-close-modal="1"><div class="modal-sheet" id="modalSheet"></div></div>';
+  root.innerHTML = '<div class="modal-overlay" id="modalOverlay"><div class="modal-sheet" id="modalSheet"></div></div>';
   document.getElementById('modalSheet').innerHTML = html;
-  document.getElementById('modalSheet').addEventListener('click', function(e){
-    if(!e.target.closest('[data-close-modal]')) e.stopPropagation();
+  document.getElementById('modalOverlay').addEventListener('click', function(e){
+    if(e.target === this) closeModal();
   });
   bindModalEvents(name, opts);
 }
