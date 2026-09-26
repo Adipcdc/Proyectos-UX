@@ -499,6 +499,8 @@ table.pivot td.zero{ color:var(--text-faint); }
 <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+<!-- ExcelJS: genera el .xlsx de horas con formato real (encabezados, negritas, subtotales). -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
 
 <script>
 /* ============ Config de Firebase (edita esto con tus propios valores) ============
@@ -529,8 +531,30 @@ var FIREBASE_CONFIG = {
 "use strict";
 
 /* ================= Constants ================= */
-var PER_DIEM_CATEGORIES = ['Airfare','Baggage','Gas','Hotel','Meals','Rental Car','Taxi / Parking','Tolls','Mileage','Per Diem'];
-var GASTOS_CATEGORIES = ['Material eléctrico','Material neumático','Material mecánico','Gasolina','Hotel','Alimentos/Comidas','Viáticos','Taxi/Estacionamiento','Casetas','Comisiones'];
+/* Los conceptos que viáticos y gastos costeados comparten (hotel, gasolina,
+   casetas, comidas, taxi/estacionamiento, el per diem en sí) usan aquí el
+   mismo nombre en las dos listas, para que un proyecto con ambos estilos
+   activados no muestre la misma categoría dos veces. Solo lo exclusivo de
+   cada estilo queda separado (Airfare/Baggage/Rental Car/Mileage por un
+   lado, Material eléctrico/neumático/mecánico y Comisiones por el otro). */
+var PER_DIEM_CATEGORIES = ['Airfare','Baggage','Gasolina','Hotel','Alimentos/Comidas','Rental Car','Taxi / Estacionamiento','Casetas','Mileage','Viáticos'];
+var GASTOS_CATEGORIES = ['Material eléctrico','Material neumático','Material mecánico','Gasolina','Hotel','Alimentos/Comidas','Viáticos','Taxi / Estacionamiento','Casetas','Comisiones'];
+/* Nombres antiguos que ya pudieran estar guardados en gastos o proyectos
+   creados antes de esta unificación, mapeados a su nombre unificado actual. */
+var CATEGORY_ALIASES = {
+  'Gas':'Gasolina',
+  'Taxi / Parking':'Taxi / Estacionamiento',
+  'Taxi/Estacionamiento':'Taxi / Estacionamiento',
+  'Tolls':'Casetas',
+  'Meals':'Alimentos/Comidas',
+  'Per Diem':'Viáticos'
+};
+function canonicalCategory(c){ return CATEGORY_ALIASES[c] || c; }
+function uniqueList(arr){
+  var seen = {}, out = [];
+  arr.forEach(function(c){ if(!seen[c]){ seen[c]=true; out.push(c); } });
+  return out;
+}
 var WEEKDAYS = ['Lun','Mar','Mié','Jue','Vie','Sáb','Dom'];
 var MONTHS = ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
 var LOCAL_PREFIX = 'viaticosux_v1_';
@@ -592,10 +616,16 @@ function selectedProject(){ return byId(state.projects, state.selectedProjectId)
 function pdEnabled(p){ if(!p) return false; if(p.perDiemEnabled!==undefined) return !!p.perDiemEnabled; return p.type==='per_diem'; }
 function gcEnabled(p){ if(!p) return false; if(p.gastosEnabled!==undefined) return !!p.gastosEnabled; return p.type==='gastos'; }
 function categoriesFor(project){
-  if(project && project.categories && project.categories.length) return project.categories;
+  /* canonicalCategory + uniqueList también limpian listas guardadas antes de
+     la unificación (ej. un proyecto con "Gas" y "Gasolina" ya guardadas por
+     separado), sin tener que migrar los datos existentes. */
+  if(project && project.categories && project.categories.length){
+    return uniqueList(project.categories.map(canonicalCategory));
+  }
   var list = [];
   if(pdEnabled(project)) list = list.concat(PER_DIEM_CATEGORIES);
   if(gcEnabled(project)) list = list.concat(GASTOS_CATEGORIES);
+  list = uniqueList(list.map(canonicalCategory));
   return list.length ? list : PER_DIEM_CATEGORIES;
 }
 function peopleFor(project){ return (project && project.people && project.people.length) ? project.people : ['Adiel Palacios']; }
@@ -762,6 +792,134 @@ function fallbackDownload(csv, filename){
     alertBanner('La exportación no está disponible en esta vista.');
   }
 }
+function downloadBlobFile(blob, filename){
+  try{
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 4000);
+  }catch(e){
+    alertBanner('La exportación no está disponible en esta vista.');
+  }
+}
+
+/* ================= Excel export: acumulado de horas ================= */
+function styleHeaderRow(row){
+  row.font = { bold:true, color:{argb:'FF1A1E27'} };
+  row.fill = { type:'pattern', pattern:'solid', fgColor:{argb:'FFE3E6EC'} };
+  row.alignment = { vertical:'middle' };
+}
+function exportHoursXLSX(project){
+  if(typeof ExcelJS==='undefined'){ alertBanner('No se pudo cargar el generador de Excel (revisa tu conexión).'); return; }
+  var entries = state.hours.filter(function(h){ return h.projectId===project.id; });
+  if(!entries.length){ alertBanner('Este proyecto no tiene horas registradas.'); return; }
+  var people = peopleFor(project);
+
+  /* Agrupa por semana ISO (lunes a domingo), igual que el resto de la app. */
+  var weeks = {};
+  entries.forEach(function(h){
+    var d = parseISODate(h.date);
+    var mon = mondayOf(d);
+    var key = toISODate(mon);
+    if(!weeks[key]) weeks[key] = { monday: mon, sunday: addDays(mon,6), weekNum: isoWeekNumber(mon), entries: [] };
+    weeks[key].entries.push(h);
+  });
+  var weekKeys = Object.keys(weeks).sort();
+  var sortEntries = function(arr){
+    return arr.slice().sort(function(a,b){
+      return a.date===b.date ? (a.start||'').localeCompare(b.start||'') : a.date.localeCompare(b.date);
+    });
+  };
+
+  var wb = new ExcelJS.Workbook();
+  wb.creator = 'Viáticos UX';
+  wb.created = new Date();
+
+  /* ---- Hoja 1: Detalle día por día, con subtotal al cierre de cada semana ---- */
+  var det = wb.addWorksheet('Detalle');
+  det.columns = [
+    { header:'Semana', key:'week', width:9 },
+    { header:'Día', key:'day', width:10 },
+    { header:'Fecha', key:'date', width:13 },
+    { header:'Persona', key:'person', width:20 },
+    { header:'Entrada', key:'start', width:10 },
+    { header:'Salida', key:'finish', width:12 },
+    { header:'Horas', key:'hours', width:9 },
+    { header:'Actividad', key:'activity', width:32 }
+  ];
+  styleHeaderRow(det.getRow(1));
+  weekKeys.forEach(function(key){
+    var wk = weeks[key];
+    var rows = sortEntries(wk.entries);
+    rows.forEach(function(h){
+      var d = parseISODate(h.date);
+      var dayName = WEEKDAYS[(d.getDay()+6)%7];
+      var row = det.addRow({
+        week: wk.weekNum, day: dayName, date: h.date,
+        person: h.person || people[0],
+        start: h.start || '', finish: h.finish || 'Manual',
+        hours: h.hours || 0, activity: h.activity || ''
+      });
+      row.getCell('hours').numFmt = '0.0';
+    });
+    var total = rows.reduce(function(a,h){ return a+(h.hours||0); }, 0);
+    var totalRow = det.addRow({ finish:'Total semana '+wk.weekNum+':', hours: total });
+    totalRow.font = { bold:true };
+    totalRow.getCell('hours').numFmt = '0.0';
+    totalRow.eachCell({ includeEmpty:true }, function(cell){ cell.border = { top:{style:'thin', color:{argb:'FFAAAAAA'}} }; });
+  });
+  det.views = [{ state:'frozen', ySplit:1 }];
+
+  /* ---- Hoja 2: Resumen semanal, con el total por persona y el total general ---- */
+  var sum = wb.addWorksheet('Resumen semanal');
+  var sumCols = [
+    { header:'Semana', key:'week', width:9 },
+    { header:'Del', key:'from', width:13 },
+    { header:'Al', key:'to', width:13 }
+  ];
+  people.forEach(function(nm){ sumCols.push({ header:nm, key:'p_'+nm, width:16 }); });
+  sumCols.push({ header:'Total semana', key:'total', width:14 });
+  sum.columns = sumCols;
+  styleHeaderRow(sum.getRow(1));
+
+  var grandTotal = 0, grandByPerson = {};
+  people.forEach(function(nm){ grandByPerson[nm] = 0; });
+  weekKeys.forEach(function(key){
+    var wk = weeks[key];
+    var rowData = { week: wk.weekNum, from: toISODate(wk.monday), to: toISODate(wk.sunday) };
+    var weekTotal = 0;
+    people.forEach(function(nm){
+      var t = wk.entries.filter(function(h){ return (h.person||people[0])===nm; }).reduce(function(a,h){return a+(h.hours||0);},0);
+      rowData['p_'+nm] = t;
+      weekTotal += t;
+      grandByPerson[nm] += t;
+    });
+    rowData.total = weekTotal;
+    grandTotal += weekTotal;
+    var r = sum.addRow(rowData);
+    people.forEach(function(nm){ r.getCell('p_'+nm).numFmt = '0.0'; });
+    r.getCell('total').numFmt = '0.0';
+    r.getCell('total').font = { bold:true };
+  });
+  var grandData = { from:'', to:'TOTAL GENERAL', total: grandTotal };
+  people.forEach(function(nm){ grandData['p_'+nm] = grandByPerson[nm]; });
+  var grandRow = sum.addRow(grandData);
+  grandRow.font = { bold:true };
+  grandRow.eachCell({ includeEmpty:true }, function(cell){ cell.fill = { type:'pattern', pattern:'solid', fgColor:{argb:'FFEDEFF3'} }; });
+  people.forEach(function(nm){ grandRow.getCell('p_'+nm).numFmt = '0.0'; });
+  grandRow.getCell('total').numFmt = '0.0';
+  sum.views = [{ state:'frozen', ySplit:1 }];
+
+  wb.xlsx.writeBuffer().then(function(buffer){
+    var blob = new Blob([buffer], { type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    var filename = 'Horas_'+project.name.replace(/[^a-z0-9]+/gi,'_')+'.xlsx';
+    downloadBlobFile(blob, filename);
+  }).catch(function(err){ console.error(err); alertBanner('No se pudo generar el archivo de Excel.'); });
+}
+
 var bannerTimeout=null;
 function alertBanner(msg){
   var el = document.getElementById('flashBanner');
@@ -882,7 +1040,7 @@ function renderGastos(){
       var d = parseISODate(e.date);
       html += '<div class="row-item" data-edit-expense="'+e.id+'">';
       html += '<div class="row-date"><div class="d">'+pad2(d.getDate())+'</div><div class="m">'+MONTHS[d.getMonth()]+'</div></div>';
-      html += '<div class="row-mid"><div class="cat">'+esc(e.category)+'</div>'+(e.note?'<div class="note">'+esc(e.note)+'</div>':'')+'</div>';
+      html += '<div class="row-mid"><div class="cat">'+esc(canonicalCategory(e.category))+'</div>'+(e.note?'<div class="note">'+esc(e.note)+'</div>':'')+'</div>';
       html += '<div class="row-amt"><div class="a">'+fmtMoney(e.currency==='USD'?e.amount:e.mxn, e.currency==='USD'?'USD':'MXN')+'</div>'+(e.currency==='USD'?'<div class="c">≈ $'+(e.mxn||0).toLocaleString('es-MX',{minimumFractionDigits:2,maximumFractionDigits:2})+' MXN</div>':'<div class="c">MXN</div>')+'</div>';
       html += '</div>';
     });
@@ -922,12 +1080,12 @@ function renderSemana(){
     var rowTotal = 0;
     var cells = days.map(function(d, i){
       var iso = toISODate(d);
-      var sum = weekExpenses.filter(function(e){ return e.category===cat && e.date===iso; })
+      var sum = weekExpenses.filter(function(e){ return canonicalCategory(e.category)===cat && e.date===iso; })
         .reduce(function(a,e){ return a + (e.mxn||0); }, 0);
       dayTotals[i]+=sum; rowTotal+=sum;
       return sum;
     });
-    if(rowTotal===0 && weekExpenses.filter(function(e){return e.category===cat;}).length===0){
+    if(rowTotal===0 && weekExpenses.filter(function(e){return canonicalCategory(e.category)===cat;}).length===0){
       // still show row, but muted
     }
     grand += rowTotal;
@@ -1115,6 +1273,7 @@ function renderResumen(){
     html += '<button class="btn sm" data-open-modal="viewAdvances" data-project="'+p.id+'">Ver abonos ('+advances.length+')</button>';
     html += '<button class="btn sm" data-open-modal="editProject" data-project="'+p.id+'">Editar</button>';
     html += '<button class="btn sm" data-export-csv="'+p.id+'">Exportar CSV</button>';
+    html += '<button class="btn sm" data-export-hours="'+p.id+'">Exportar horas (Excel)</button>';
     html += '</div></div>';
   });
 
@@ -1256,7 +1415,7 @@ function modalExpenseForm(expense){
   html += '<div class="field"><label>Fecha</label><input class="input" type="date" id="eeDate" value="'+expense.date+'"></div>';
   html += '<div class="field"><label>Moneda</label><div class="segmented" id="eeCurSeg"><button type="button" data-cur="MXN" class="'+(cur==='MXN'?'active':'')+'">MXN</button><button type="button" data-cur="USD" class="'+(cur==='USD'?'active':'')+'">USD</button></div></div>';
   html += '</div>';
-  html += '<div class="field" style="margin-top:10px;"><label>Categoría</label><select class="input" id="eeCategory">'+cats.map(function(c){return '<option value="'+esc(c)+'" '+(c===expense.category?'selected':'')+'>'+esc(c)+'</option>';}).join('')+'</select></div>';
+  html += '<div class="field" style="margin-top:10px;"><label>Categoría</label><select class="input" id="eeCategory">'+cats.map(function(c){return '<option value="'+esc(c)+'" '+(c===canonicalCategory(expense.category)?'selected':'')+'>'+esc(c)+'</option>';}).join('')+'</select></div>';
   html += '<div class="field-row" style="margin-top:10px;">';
   html += '<div class="field"><label>Monto</label><input class="input num" type="number" step="0.01" min="0" id="eeAmount" value="'+expense.amount+'"></div>';
   html += '<div class="field" id="eeFxWrap" style="'+(cur==='USD'?'':'display:none;')+'"><label>T/C</label><input class="input num" type="number" step="0.0001" min="0" id="eeFx" value="'+(expense.fx||17.3)+'"></div>';
@@ -1635,6 +1794,13 @@ document.addEventListener('click', function(e){
       data.start = s; data.finish = f; data.hours = computeHours(s,f);
     }
     addRecord('hours', data).then(function(){ alertBanner('Horas guardadas.'); render(); });
+    return;
+  }
+
+  var exportHrsBtn = t.closest('[data-export-hours]');
+  if(exportHrsBtn){
+    var projH = byId(state.projects, exportHrsBtn.getAttribute('data-export-hours'));
+    if(projH) exportHoursXLSX(projH);
     return;
   }
 
