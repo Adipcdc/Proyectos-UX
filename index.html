@@ -621,7 +621,12 @@ function compressImageFile(file){
       var img = new Image();
       img.onerror = function(){ reject(new Error('decode_failed')); };
       img.onload = function(){
-        var steps = [[1400,0.72],[1200,0.55],[1000,0.42],[800,0.32],[650,0.25]];
+        /* Márgenes más estrictos que antes: una foto tomada directamente con
+           la cámara del celular (varios MB) pasaba la compresión pero el
+           documento completo (foto + demás campos) quedaba tan pegado al
+           límite de 1 MB de Firestore que el guardado fallaba en silencio.
+           Bajamos el objetivo y el tope máximo para dejar margen real. */
+        var steps = [[1400,0.72],[1200,0.55],[1000,0.42],[800,0.32],[650,0.25],[500,0.2],[380,0.18]];
         var dataUrl = null;
         for(var i=0;i<steps.length;i++){
           var maxDim = steps[i][0], quality = steps[i][1];
@@ -631,9 +636,9 @@ function compressImageFile(file){
           canvas.width = cw; canvas.height = ch;
           canvas.getContext('2d').drawImage(img, 0, 0, cw, ch);
           dataUrl = canvas.toDataURL('image/jpeg', quality);
-          if(dataUrl.length <= 700000) break;
+          if(dataUrl.length <= 480000) break;
         }
-        if(!dataUrl || dataUrl.length > 950000){ reject(new Error('too_large')); return; }
+        if(!dataUrl || dataUrl.length > 700000){ reject(new Error('too_large')); return; }
         resolve(dataUrl);
       };
       img.src = reader.result;
@@ -1958,18 +1963,29 @@ function bindModalEvents(name, opts){
       });
     }
     document.getElementById('eeSaveBtn').addEventListener('click', function(){
-      var id = document.getElementById('eeSaveBtn').getAttribute('data-id');
+      var btn = this;
+      if(btn.disabled) return;
+      var id = btn.getAttribute('data-id');
       var cur = curSeg.querySelector('button.active').getAttribute('data-cur');
       var amount = parseFloat(document.getElementById('eeAmount').value)||0;
       var fx = cur==='USD' ? (parseFloat(document.getElementById('eeFx').value)||1) : 1;
       var mxn = cur==='USD' ? amount*fx : amount;
+      var origText = btn.textContent;
+      btn.disabled = true; btn.textContent = 'Guardando…';
       updateRecord('expenses', id, {
         date: document.getElementById('eeDate').value,
         category: document.getElementById('eeCategory').value,
         currency: cur, amount: amount, fx: fx, mxn: mxn,
         note: document.getElementById('eeNote').value.trim(),
         photo: pendingEePhoto
-      }).then(closeModal);
+      }).then(closeModal).catch(function(err){
+        console.error(err);
+        var msg = pendingEePhoto
+          ? 'No se pudo guardar el gasto (posiblemente por la foto adjunta). Intenta quitar la foto y guardar de nuevo, o tómala con menor resolución.'
+          : 'No se pudo guardar el gasto. Intenta de nuevo.';
+        alertBanner(msg);
+        btn.disabled = false; btn.textContent = origText;
+      });
     });
     document.getElementById('eeDeleteBtn').addEventListener('click', function(){
       var id = document.getElementById('eeDeleteBtn').getAttribute('data-id');
@@ -2190,6 +2206,7 @@ document.addEventListener('click', function(e){
 
   var saveExp = t.closest('#saveExpenseBtn');
   if(saveExp){
+    if(saveExp.disabled) return; /* evita duplicar el gasto si se da doble clic */
     var p = selectedProject();
     if(!p) return;
     var amount = parseFloat(document.getElementById('expAmount').value);
@@ -2197,6 +2214,9 @@ document.addEventListener('click', function(e){
     var cur = state.expenseCurrency;
     var fx = cur==='USD' ? (parseFloat(document.getElementById('expFx').value)||1) : 1;
     var mxn = cur==='USD' ? amount*fx : amount;
+    saveExp.disabled = true;
+    var saveExpOrigText = saveExp.textContent;
+    saveExp.textContent = 'Guardando…';
     addRecord('expenses', {
       projectId: p.id,
       date: document.getElementById('expDate').value || todayISO(),
@@ -2210,6 +2230,19 @@ document.addEventListener('click', function(e){
       state.expenseCurrency='MXN';
       pendingExpensePhoto = null;
       render();
+    }).catch(function(err){
+      /* Antes esto fallaba en silencio (sin .catch), sobre todo cuando la
+         foto adjunta dejaba el documento demasiado cerca del límite de 1 MB
+         de Firestore: la promesa se rechazaba y el botón no hacía nada
+         visible. Ahora siempre se avisa, y si la foto es la sospechosa se
+         sugiere quitarla y volver a intentar. */
+      console.error(err);
+      var msg = pendingExpensePhoto
+        ? 'No se pudo guardar el gasto (posiblemente por la foto adjunta). Intenta quitar la foto y guardar de nuevo, o tómala con menor resolución.'
+        : 'No se pudo guardar el gasto. Intenta de nuevo.';
+      alertBanner(msg);
+      saveExp.disabled = false;
+      saveExp.textContent = saveExpOrigText;
     });
     return;
   }
