@@ -1142,10 +1142,15 @@ function exportGastosXLSX(project){
         if(ext!=='png' && ext!=='jpeg' && ext!=='gif') ext = 'jpeg';
         var imgId = wb.addImage({ base64: e.photo, extension: ext });
         var imgRowIndex = pic.rowCount; /* fila justo debajo de la ficha, 0-based para addImage */
-        var rowsForImage = Math.max(2, Math.ceil(targetH/20));
+        /* Calcula filas de sobra con margen generoso (divisor conservador +
+           2 filas extra de colchón), porque la altura real de fila por
+           default en Excel varía ligeramente según fuente/versión — si se
+           calcula muy justo, la imagen alcanza a montarse sobre la ficha
+           del siguiente comprobante. */
+        var rowsForImage = Math.max(2, Math.ceil(targetH/17)) + 2;
         for(var r=0;r<rowsForImage;r++) pic.addRow([]);
         pic.addImage(imgId, { tl:{ col:0.1, row: imgRowIndex + 0.1 }, ext:{ width: targetW, height: targetH } });
-        pic.addRow([]); /* espacio entre comprobantes */
+        pic.addRow([]); pic.addRow([]); /* espacio de sobra entre comprobantes */
       });
       pic.views = [{ state:'frozen', ySplit:6 }];
     }
