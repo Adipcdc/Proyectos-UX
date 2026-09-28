@@ -892,6 +892,19 @@ function styleColumnHeaderRow(row, numCols){
   row.alignment = { vertical:'middle', horizontal:'center' };
   for(var i=1;i<=numCols;i++){ row.getCell(i).fill = { type:'pattern', pattern:'solid', fgColor:{argb:XLS_NAVY} }; }
 }
+/* Barra de sección azul marino a mitad de hoja (misma idea que la fila 4 de
+   addSheetHeader, pero reutilizable para separar bloques dentro de una
+   misma hoja, como en "Main": RESUMEN DE GASTOS / ABONOS RECIBIDOS / SALDO). */
+function addSectionBar(ws, numCols, title){
+  var row = ws.addRow([title]);
+  ws.mergeCells(row.number, 1, row.number, numCols);
+  row.height = 20;
+  var c = row.getCell(1);
+  c.font = { bold:true, size:12, color:{argb:'FFFFFFFF'} };
+  c.alignment = { horizontal:'center', vertical:'middle' };
+  c.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XLS_NAVY} };
+  return row;
+}
 function exportHoursXLSX(project){
   if(typeof ExcelJS==='undefined'){ alertBanner('No se pudo cargar el generador de Excel (revisa tu conexión).'); return; }
   var entries = state.hours.filter(function(h){ return h.projectId===project.id; });
@@ -1045,6 +1058,65 @@ function exportGastosXLSX(project){
     wb.creator = 'Viáticos UX';
     wb.created = new Date();
 
+    /* ---- Hoja "Main": resumen de gastos por semana + abonos recibidos +
+       saldo pendiente, igual que la hoja principal de tu archivo actual.
+       Se deja como primera pestaña. Los totales usan fórmulas reales de
+       Excel (no solo el valor calculado), para que si luego editas algo a
+       mano el saldo se recalcule solo. ---- */
+    var main = wb.addWorksheet('Main');
+    var mainCols = [ { key:'a', width:24 }, { key:'b', width:17 }, { key:'c', width:19 }, { key:'d', width:24 } ];
+    main.columns = mainCols;
+    addSheetHeader(main, mainCols.length, project, 'CONTROL DE ABONOS DE GASTOS COSTEADOS');
+
+    var gHeaderRow = main.addRow({ a:'Semana', b:'Periodo', c:'Total Gastado', d:'Hoja de referencia' });
+    styleColumnHeaderRow(gHeaderRow, mainCols.length);
+    var firstGastoDataRow = gHeaderRow.number + 1;
+    weekKeys.forEach(function(key){
+      var wk = weeks[key];
+      var totalMXN = wk.entries.reduce(function(a,e){ return a+(e.mxn||0); }, 0);
+      var r = main.addRow({ a:'Semana '+wk.weekNum, b: shortDate(wk.monday)+' al '+shortDate(wk.sunday), c: totalMXN, d:'Detalle de gastos' });
+      r.getCell('c').numFmt = '#,##0.00';
+    });
+    var lastGastoDataRow = main.rowCount;
+    var gastoTotalRow = main.addRow({ b:'TOTAL GASTADO ACUMULADO', c:{ formula: 'SUM(C'+firstGastoDataRow+':C'+lastGastoDataRow+')' } });
+    gastoTotalRow.font = { bold:true };
+    gastoTotalRow.getCell('c').numFmt = '#,##0.00';
+    gastoTotalRow.eachCell({ includeEmpty:true }, function(cell){ cell.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XLS_TOTAL_TINT} }; });
+    var gastoTotalCellAddr = 'C'+gastoTotalRow.number;
+
+    main.addRow([]);
+    addSectionBar(main, mainCols.length, 'ABONOS RECIBIDOS');
+    var advancesList = state.advances.filter(function(a){ return a.projectId===project.id; }).sort(function(a,b){ return a.date.localeCompare(b.date); });
+    var aHeaderRow = main.addRow({ a:'Fecha', b:'Monto', c:'Método / Referencia', d:'Nota' });
+    styleColumnHeaderRow(aHeaderRow, mainCols.length);
+    var firstAbonoDataRow = aHeaderRow.number + 1;
+    if(advancesList.length){
+      advancesList.forEach(function(a){
+        var r = main.addRow({ a:a.date, b:a.amount||0, c:a.method||'', d:a.note||'' });
+        r.getCell('b').numFmt = '#,##0.00';
+      });
+    } else {
+      main.addRow({ a:'Sin abonos registrados todavía.' });
+    }
+    var lastAbonoDataRow = main.rowCount;
+    var abonoTotalRow = main.addRow({ a:'TOTAL ABONADO', b: advancesList.length ? { formula: 'SUM(B'+firstAbonoDataRow+':B'+lastAbonoDataRow+')' } : 0 });
+    abonoTotalRow.font = { bold:true };
+    abonoTotalRow.getCell('b').numFmt = '#,##0.00';
+    abonoTotalRow.eachCell({ includeEmpty:true }, function(cell){ cell.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XLS_TOTAL_TINT} }; });
+    var abonoTotalCellAddr = 'B'+abonoTotalRow.number;
+
+    main.addRow([]);
+    addSectionBar(main, mainCols.length, 'SALDO');
+    var saldoR1 = main.addRow({ a:'Total Gastado Acumulado', b:{ formula: gastoTotalCellAddr } });
+    saldoR1.getCell('b').numFmt = '#,##0.00';
+    var saldoR2 = main.addRow({ a:'Total Abonado', b:{ formula: abonoTotalCellAddr } });
+    saldoR2.getCell('b').numFmt = '#,##0.00';
+    var saldoRow = main.addRow({ a:'SALDO PENDIENTE POR COBRAR', b:{ formula: 'B'+saldoR1.number+'-B'+saldoR2.number } });
+    saldoRow.font = { bold:true, size:12, color:{argb:'FFFFFFFF'} };
+    saldoRow.getCell('b').numFmt = '#,##0.00';
+    saldoRow.eachCell({ includeEmpty:true }, function(cell){ cell.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XLS_ORANGE} }; cell.font = { bold:true, color:{argb:'FFFFFFFF'} }; });
+    main.views = [{ state:'frozen', ySplit:6 }];
+
     /* ---- Hoja 1: Detalle de gastos, con subtotal al cierre de cada semana ---- */
     var det = wb.addWorksheet('Detalle de gastos');
     var detCols = [
@@ -1142,15 +1214,13 @@ function exportGastosXLSX(project){
         if(ext!=='png' && ext!=='jpeg' && ext!=='gif') ext = 'jpeg';
         var imgId = wb.addImage({ base64: e.photo, extension: ext });
         var imgRowIndex = pic.rowCount; /* fila justo debajo de la ficha, 0-based para addImage */
-        /* Calcula filas de sobra con margen generoso (divisor conservador +
-           2 filas extra de colchón), porque la altura real de fila por
-           default en Excel varía ligeramente según fuente/versión — si se
-           calcula muy justo, la imagen alcanza a montarse sobre la ficha
-           del siguiente comprobante. */
-        var rowsForImage = Math.max(2, Math.ceil(targetH/17)) + 2;
+        /* 20px es la altura real de fila por default en Excel (15pt); se
+           deja solo 1 fila de colchón (no 2) para que quede un respiro
+           visible sin dejar tanto espacio en blanco de más. */
+        var rowsForImage = Math.max(2, Math.ceil(targetH/20)) + 1;
         for(var r=0;r<rowsForImage;r++) pic.addRow([]);
         pic.addImage(imgId, { tl:{ col:0.1, row: imgRowIndex + 0.1 }, ext:{ width: targetW, height: targetH } });
-        pic.addRow([]); pic.addRow([]); /* espacio de sobra entre comprobantes */
+        pic.addRow([]); /* espacio entre comprobantes */
       });
       pic.views = [{ state:'frozen', ySplit:6 }];
     }
