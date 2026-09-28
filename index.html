@@ -1092,7 +1092,7 @@ function exportGastosXLSX(project){
     var firstAbonoDataRow = aHeaderRow.number + 1;
     if(advancesList.length){
       advancesList.forEach(function(a){
-        var r = main.addRow({ a:a.date, b:a.amount||0, c:a.method||'', d:a.note||'' });
+        var r = main.addRow({ a:a.date, b:a.amount||0, c:(a.method||'')+(a.reference?' · '+a.reference:''), d:a.note||'' });
         r.getCell('b').numFmt = '#,##0.00';
       });
     } else {
@@ -1702,7 +1702,12 @@ function modalAdvanceForm(projectId){
   html += '<div class="hint" style="margin-bottom:10px;">Proyecto: <b style="color:var(--text)">'+esc(p?p.name:'')+'</b></div>';
   html += '<div class="field"><label>Fecha</label><input class="input" type="date" id="advDate" value="'+todayISO()+'"></div>';
   html += '<div class="field" style="margin-top:10px;"><label>Monto (MXN)</label><input class="input num" type="number" step="0.01" min="0" id="advAmount" placeholder="0.00"></div>';
-  html += '<div class="field" style="margin-top:10px;"><label>Método / Referencia</label><input class="input" type="text" id="advMethod" placeholder="Ej. Transferencia" ></div>';
+  html += '<div class="field" style="margin-top:10px;"><label>Tipo de abono</label><div class="segmented" id="advTypeSeg">'+
+    '<button type="button" data-advtype="Transferencia" class="active">Transferencia</button>'+
+    '<button type="button" data-advtype="Depósito">Depósito</button>'+
+    '<button type="button" data-advtype="Efectivo">Efectivo</button>'+
+    '</div></div>';
+  html += '<div class="field" style="margin-top:10px;"><label>Referencia (opcional)</label><input class="input" type="text" id="advReference" placeholder="Ej. Folio 4471, últimos 4 dígitos de cuenta"></div>';
   html += '<div class="field" style="margin-top:10px;"><label>Nota (opcional)</label><input class="input" type="text" id="advNote" placeholder="Ej. Segundo depósito"></div>';
   html += '<button class="btn accent block" style="margin-top:16px;" id="advSaveBtn" data-project="'+projectId+'">Guardar abono</button>';
   return html;
@@ -1720,7 +1725,7 @@ function modalViewAdvances(projectId){
       var d = parseISODate(a.date);
       html += '<div class="row-item">';
       html += '<div class="row-date"><div class="d">'+pad2(d.getDate())+'</div><div class="m">'+MONTHS[d.getMonth()]+'</div></div>';
-      html += '<div class="row-mid"><div class="cat">'+esc(a.method||'Abono')+'</div>'+(a.note?'<div class="note">'+esc(a.note)+'</div>':'')+'</div>';
+      html += '<div class="row-mid"><div class="cat">'+esc(a.method||'Abono')+(a.reference?' · '+esc(a.reference):'')+'</div>'+(a.note?'<div class="note">'+esc(a.note)+'</div>':'')+'</div>';
       html += '<div class="row-amt"><div class="a">'+fmtMoney(a.amount,'MXN')+'</div></div>';
       html += '<button class="btn sm danger" data-delete-advance="'+a.id+'" style="margin-left:6px;">✕</button>';
       html += '</div>';
@@ -1965,16 +1970,32 @@ function bindModalEvents(name, opts){
     }
   }
   else if(name==='newAdvance'){
+    var advTypeSeg = document.getElementById('advTypeSeg');
+    advTypeSeg.querySelectorAll('button').forEach(function(b){
+      b.addEventListener('click', function(){
+        advTypeSeg.querySelectorAll('button').forEach(function(x){x.classList.remove('active');});
+        b.classList.add('active');
+      });
+    });
     document.getElementById('advSaveBtn').addEventListener('click', function(){
+      var btn = this;
+      if(btn.disabled) return;
       var amt = parseFloat(document.getElementById('advAmount').value);
       if(!amt || amt<=0){ alertBanner('Ingresa un monto válido.'); return; }
+      var origText = btn.textContent;
+      btn.disabled = true; btn.textContent = 'Guardando…';
       addRecord('advances', {
         projectId: opts.project,
         date: document.getElementById('advDate').value || todayISO(),
         amount: amt,
-        method: document.getElementById('advMethod').value.trim(),
+        method: advTypeSeg.querySelector('button.active').getAttribute('data-advtype'),
+        reference: document.getElementById('advReference').value.trim(),
         note: document.getElementById('advNote').value.trim()
-      }).then(closeModal);
+      }).then(function(){ alertBanner('Abono guardado.'); closeModal(); }).catch(function(err){
+        console.error(err);
+        alertBanner('No se pudo guardar el abono. Intenta de nuevo.');
+        btn.disabled = false; btn.textContent = origText;
+      });
     });
   }
   else if(name==='viewAdvances'){
