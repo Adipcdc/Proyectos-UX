@@ -931,44 +931,7 @@ function exportHoursXLSX(project){
   wb.creator = 'Viáticos UX';
   wb.created = new Date();
 
-  /* ---- Hoja 1: Detalle día por día, con subtotal al cierre de cada semana ---- */
-  var det = wb.addWorksheet('Detalle');
-  var detCols = [
-    { key:'week', width:9 }, { key:'day', width:10 }, { key:'date', width:13 },
-    { key:'person', width:20 }, { key:'start', width:10 }, { key:'finish', width:12 },
-    { key:'hours', width:9 }, { key:'activity', width:32 }
-  ];
-  det.columns = detCols;
-  addSheetHeader(det, detCols.length, project, 'DETALLE DE HORAS POR SEMANA');
-  var detHeaderRow = det.addRow({ week:'Semana', day:'Día', date:'Fecha', person:'Persona', start:'Entrada', finish:'Salida', hours:'Horas', activity:'Actividad' });
-  styleColumnHeaderRow(detHeaderRow, detCols.length);
-
-  weekKeys.forEach(function(key){
-    var wk = weeks[key];
-    var rows = sortEntries(wk.entries);
-    rows.forEach(function(h){
-      var d = parseISODate(h.date);
-      var dayName = WEEKDAYS[(d.getDay()+6)%7];
-      var row = det.addRow({
-        week: wk.weekNum, day: dayName, date: h.date,
-        person: h.person || people[0],
-        start: h.start || '', finish: h.finish || 'Manual',
-        hours: h.hours || 0, activity: h.activity || ''
-      });
-      row.getCell('hours').numFmt = '0.0';
-    });
-    var total = rows.reduce(function(a,h){ return a+(h.hours||0); }, 0);
-    var totalRow = det.addRow({ finish:'Total semana '+wk.weekNum+':', hours: total });
-    totalRow.font = { bold:true };
-    totalRow.getCell('hours').numFmt = '0.0';
-    totalRow.eachCell({ includeEmpty:true }, function(cell){
-      cell.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XLS_TOTAL_TINT} };
-      cell.border = { top:{style:'thin', color:{argb:'FFAAAAAA'}} };
-    });
-  });
-  det.views = [{ state:'frozen', ySplit:6 }];
-
-  /* ---- Hoja 2: Resumen semanal, con el total por persona y el total general ---- */
+  /* ---- Hoja 1: Resumen semanal, con el total por persona y el total general ---- */
   var sum = wb.addWorksheet('Resumen semanal');
   var sumCols = [ { key:'week', width:9 }, { key:'from', width:13 }, { key:'to', width:13 } ];
   people.forEach(function(nm){ sumCols.push({ key:'p_'+nm, width:16 }); });
@@ -1007,6 +970,43 @@ function exportHoursXLSX(project){
   people.forEach(function(nm){ grandRow.getCell('p_'+nm).numFmt = '0.0'; });
   grandRow.getCell('total').numFmt = '0.0';
   sum.views = [{ state:'frozen', ySplit:6 }];
+
+  /* ---- Hoja 2: Detalle día por día, con subtotal al cierre de cada semana ---- */
+  var det = wb.addWorksheet('Detalle');
+  var detCols = [
+    { key:'week', width:9 }, { key:'day', width:10 }, { key:'date', width:13 },
+    { key:'person', width:20 }, { key:'start', width:10 }, { key:'finish', width:12 },
+    { key:'hours', width:9 }, { key:'activity', width:32 }
+  ];
+  det.columns = detCols;
+  addSheetHeader(det, detCols.length, project, 'DETALLE DE HORAS POR SEMANA');
+  var detHeaderRow = det.addRow({ week:'Semana', day:'Día', date:'Fecha', person:'Persona', start:'Entrada', finish:'Salida', hours:'Horas', activity:'Actividad' });
+  styleColumnHeaderRow(detHeaderRow, detCols.length);
+
+  weekKeys.forEach(function(key){
+    var wk = weeks[key];
+    var rows = sortEntries(wk.entries);
+    rows.forEach(function(h){
+      var d = parseISODate(h.date);
+      var dayName = WEEKDAYS[(d.getDay()+6)%7];
+      var row = det.addRow({
+        week: wk.weekNum, day: dayName, date: h.date,
+        person: h.person || people[0],
+        start: h.start || '', finish: h.finish || 'Manual',
+        hours: h.hours || 0, activity: h.activity || ''
+      });
+      row.getCell('hours').numFmt = '0.0';
+    });
+    var total = rows.reduce(function(a,h){ return a+(h.hours||0); }, 0);
+    var totalRow = det.addRow({ finish:'Total semana '+wk.weekNum+':', hours: total });
+    totalRow.font = { bold:true };
+    totalRow.getCell('hours').numFmt = '0.0';
+    totalRow.eachCell({ includeEmpty:true }, function(cell){
+      cell.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XLS_TOTAL_TINT} };
+      cell.border = { top:{style:'thin', color:{argb:'FFAAAAAA'}} };
+    });
+  });
+  det.views = [{ state:'frozen', ySplit:6 }];
 
   wb.xlsx.writeBuffer().then(function(buffer){
     var blob = new Blob([buffer], { type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
@@ -1801,6 +1801,8 @@ function modalCopyHoursForm(project){
   html += '<div class="chip active" data-cph-scope="week">Solo semana '+wk+' (la que estás viendo)</div>';
   html += '<div class="chip" data-cph-scope="all">Todo el historial de este proyecto</div>';
   html += '</div></div>';
+  html += '<div class="field" style="margin-top:12px;"><label>Actividad para las horas copiadas (opcional)</label><input class="input" type="text" id="cphActivity" placeholder="Ej. Electrical support" maxlength="160"></div>';
+  html += '<div class="hint" style="margin-top:6px;">Si la dejas vacía, cada registro copiado conserva su actividad original. Si escribes algo aquí, todos los registros copiados a la persona destino quedan con esta actividad en vez de la de origen.</div>';
   html += '<button class="btn accent block" style="margin-top:16px;" id="cphSaveBtn" data-project="'+project.id+'">Copiar horas</button>';
   return html;
 }
@@ -2148,6 +2150,7 @@ function bindModalEvents(name, opts){
         return true;
       });
       if(!source.length){ alertBanner('No hay horas de '+from+' en ese rango.'); return; }
+      var activityOverride = document.getElementById('cphActivity').value.trim();
       btn.disabled = true;
       btn.textContent = 'Copiando…';
       var isNewPerson = !!toNew && peeps.indexOf(toNew)===-1;
@@ -2155,7 +2158,7 @@ function bindModalEvents(name, opts){
       prep.then(function(){
         return Promise.all(source.map(function(h){
           return addRecord('hours', {
-            projectId: pid, person: to, date: h.date, activity: h.activity||'',
+            projectId: pid, person: to, date: h.date, activity: activityOverride || h.activity || '',
             start: h.start||null, finish: h.finish||null, hours: h.hours||0
           });
         }));
