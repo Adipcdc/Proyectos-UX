@@ -1010,7 +1010,7 @@ function exportHoursXLSX(project){
 
   wb.xlsx.writeBuffer().then(function(buffer){
     var blob = new Blob([buffer], { type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-    var filename = 'Horas_'+project.name.replace(/[^a-z0-9]+/gi,'_')+'.xlsx';
+    var filename = 'Horas_'+project.name.replace(/[^a-z0-9]+/gi,'_')+'_'+todayISO()+'.xlsx';
     downloadBlobFile(blob, filename);
   }).catch(function(err){ console.error(err); alertBanner('No se pudo generar el archivo de Excel.'); });
 }
@@ -1227,7 +1227,7 @@ function exportGastosXLSX(project){
 
     wb.xlsx.writeBuffer().then(function(buffer){
       var blob = new Blob([buffer], { type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-      var filename = 'Gastos_'+project.name.replace(/[^a-z0-9]+/gi,'_')+'.xlsx';
+      var filename = 'Gastos_'+project.name.replace(/[^a-z0-9]+/gi,'_')+'_'+todayISO()+'.xlsx';
       downloadBlobFile(blob, filename);
     }).catch(function(err){ console.error(err); alertBanner('No se pudo generar el archivo de Excel.'); });
   }).catch(function(err){ console.error(err); alertBanner('No se pudo generar el archivo de Excel.'); });
