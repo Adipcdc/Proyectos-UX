@@ -1,3 +1,4 @@
+<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>*{box-sizing:border-box}body{margin:0}</style></head><body>
 <title>Viáticos UX</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
 <style>
@@ -506,6 +507,11 @@ table.pivot td.zero{ color:var(--text-faint); }
 /* ============ Config de Firebase (edita esto con tus propios valores) ============
    Consíguelos en: Firebase Console → ⚙️ Configuración del proyecto → tus apps → Config
    Si lo dejas como null, la app sigue funcionando en modo "solo este dispositivo". */
+/* Token de consulta de Banxico (SIE API) para el tipo de cambio FIX automático.
+   Se solicita gratis en: https://www.banxico.org.mx/SieAPIRest/service/v1/token
+   Si lo dejas vacío, el campo T/C sigue siendo manual. */
+var BANXICO_TOKEN = '5840a49bd275863bff4b9a18e9254751d46ea271c07de125104b822fda3da504';
+
 var FIREBASE_CONFIG = {
   apiKey: "AIzaSyBnm3lZOj3rnhWeoWFFeHZRX-eqeCsiFpM",
   authDomain: "gestionproy-ux.firebaseapp.com",
@@ -563,12 +569,14 @@ var LOCAL_PREFIX = 'viaticosux_v1_';
 var state = {
   projects: [], expenses: [], hours: [], advances: [],
   loaded: { projects:false, expenses:false, hours:false, advances:false },
+  roles: {}, members: {}, invites: {}, me: {},
   currentTab: 'gastos',
   selectedProjectId: null,
   weekStart: mondayOf(new Date()),
   editing: { expenseId:null, hoursId:null, projectId:null },
   hoursManual: false,
   expenseCurrency: 'MXN',
+  fxManual: false, fxAuto: null,
   hoursPersonFilter: 'all',
   confirmDelete: null /* {type, id} */
 };
@@ -667,7 +675,41 @@ function categoriesFor(project){
   list = uniqueList(list.map(canonicalCategory));
   return list.length ? list : PER_DIEM_CATEGORIES;
 }
-function peopleFor(project){ return (project && project.people && project.people.length) ? project.people : ['Adiel Palacios']; }
+var ROLE_LABELS = { admin:'Administrador', capturista:'Capturista', integrante:'Integrante' };
+function fbMode(){ return !!window.__fbmode; }
+function myUid(){ return window.__authUser ? window.__authUser.uid : null; }
+function myRole(p){ if(!fbMode()) return 'admin'; return (p && state.roles[p.id]) || 'integrante'; }
+function isAdminRole(p){ return myRole(p)==='admin'; }
+function isStaffRole(p){ var r = myRole(p); return r==='admin' || r==='capturista'; }
+function defaultMyName(){
+  var u = window.__authUser; if(!u) return 'Adiel Palacios';
+  return u.displayName || (u.email ? u.email.split('@')[0] : 'Yo');
+}
+function myName(p){ var m = p && state.me[p.id]; return (m && m.name) || defaultMyName(); }
+function linkedMembers(p){ return (p && state.members[p.id]) ? state.members[p.id] : []; }
+function linkedNames(p){ return linkedMembers(p).map(function(m){ return m.name; }); }
+function unlinkedPeople(p){
+  var ln = linkedNames(p);
+  return ((p && p.people) || []).filter(function(n){ return ln.indexOf(n)===-1; });
+}
+function ownerUidFor(p, name){
+  if(!fbMode()) return null;
+  if(!isStaffRole(p)) return myUid();
+  if(name===myName(p)) return myUid();
+  var ms = linkedMembers(p);
+  for(var i=0;i<ms.length;i++){ if(ms[i].name===name) return ms[i].uid; }
+  return '';
+}
+function peopleFor(project){
+  if(fbMode() && project){
+    if(!isStaffRole(project)) return [myName(project)];
+    var names = [myName(project)];
+    linkedNames(project).forEach(function(n){ if(names.indexOf(n)===-1) names.push(n); });
+    unlinkedPeople(project).forEach(function(n){ if(names.indexOf(n)===-1) names.push(n); });
+    return names;
+  }
+  return (project && project.people && project.people.length) ? project.people : ['Adiel Palacios'];
+}
 function personColor(project, name){
   var list = peopleFor(project);
   var idx = list.indexOf(name);
@@ -715,6 +757,8 @@ function subscribeAll(){
   }
 }
 function addRecord(col, data){
+  data = Object.assign({}, data); Object.keys(data).forEach(function(k){ if(data[k]===undefined) delete data[k]; });
+  if(fbMode()) return fbAdd(col, data);
   var body = Object.assign({}, data, { createdAt: new Date().toISOString() });
   if(usingLocal){
     var id = uid();
@@ -727,6 +771,7 @@ function addRecord(col, data){
   return dbCap.collection(col).add(body).then(function(ref){ return ref.id; });
 }
 function updateRecord(col, id, data){
+  if(fbMode()) return fbUpdate(col, id, data);
   if(usingLocal){
     var arr = localGet(col);
     var idx = -1;
@@ -737,6 +782,7 @@ function updateRecord(col, id, data){
   return dbCap.collection(col).doc(id).update(data);
 }
 function deleteRecord(col, id){
+  if(fbMode()) return fbDelete(col, id);
   if(usingLocal){
     var arr = localGet(col).filter(function(x){ return x.id!==id; });
     localSet(col, arr);
@@ -744,6 +790,301 @@ function deleteRecord(col, id){
     return Promise.resolve();
   }
   return dbCap.collection(col).doc(id).delete();
+}
+
+
+/* ================= Acceso con cuenta (solo versión web independiente) ================= */
+function authMsg(err){
+  var c = (err && err.code) || '';
+  if(c==='auth/invalid-email') return 'El correo no es válido.';
+  if(c==='auth/missing-password') return 'Escribe tu contraseña.';
+  if(c==='auth/weak-password') return 'La contraseña debe tener al menos 6 caracteres.';
+  if(c==='auth/email-already-in-use') return 'Ese correo ya tiene cuenta. Usa "Entrar".';
+  if(c==='auth/invalid-credential' || c==='auth/wrong-password' || c==='auth/user-not-found' || c==='auth/invalid-login-credentials') return 'Correo o contraseña incorrectos.';
+  if(c==='auth/too-many-requests') return 'Demasiados intentos. Espera unos minutos.';
+  if(c==='auth/network-request-failed') return 'Sin conexión. Revisa tu internet.';
+  if(c==='auth/operation-not-allowed') return 'El acceso con correo no está habilitado en Firebase.';
+  return 'No se pudo completar (' + (c||'error') + ').';
+}
+function showLogin(){
+  var el = document.getElementById('authOverlay');
+  if(!el){
+    el = document.createElement('div');
+    el.id = 'authOverlay';
+    el.style.cssText = 'position:fixed;inset:0;z-index:9999;background:var(--bg);overflow:auto;padding:24px 16px;';
+    el.innerHTML =
+      '<div style="max-width:380px;margin:8vh auto 0;">' +
+      '<div class="wordmark" style="font-size:26px;font-weight:700;margin-bottom:4px;">Viáticos<span class="accent-dot">·</span>UX</div>' +
+      '<div class="hint" style="margin:0 0 16px;">Inicia sesión para ver los proyectos en los que participas. Usa una contraseña exclusiva para esta app, distinta a la de tu correo.</div>' +
+      '<div class="card">' +
+      '<div class="field"><label>Tu nombre (solo al crear cuenta)</label><input class="input" type="text" id="authName" autocomplete="name" placeholder="Ej. Álvaro Pérez"></div>' +
+      '<div class="field" style="margin-top:10px;"><label>Correo</label><input class="input" type="email" id="authEmail" autocomplete="email" autocapitalize="none" placeholder="tu@correo.com"></div>' +
+      '<div class="field" style="margin-top:10px;"><label>Contraseña</label><input class="input" type="password" id="authPass" autocomplete="current-password" placeholder="Mínimo 6 caracteres"></div>' +
+      '<div id="authError" style="display:none;margin-top:10px;font-size:12.5px;color:var(--bad);"></div>' +
+      '<button class="btn accent block" style="margin-top:14px;" id="authLoginBtn">Entrar</button>' +
+      '<button class="btn block ghost" style="margin-top:8px;" id="authSignupBtn">Crear cuenta nueva</button>' +
+      '<button class="btn sm ghost" type="button" style="margin-top:8px;" id="authResetBtn">Olvidé mi contraseña</button>' +
+      '</div></div>';
+    document.body.appendChild(el);
+  }
+  el.style.display = 'block';
+}
+function hideLogin(){ var el = document.getElementById('authOverlay'); if(el) el.style.display = 'none'; }
+function authErr(m, ok){
+  var e = document.getElementById('authError'); if(!e) return;
+  e.textContent = m; e.style.display = m ? 'block' : 'none'; e.style.color = ok ? 'var(--good)' : 'var(--bad)';
+}
+function legacyMigrate(){
+  var fdb = window.__fdb, u = window.__authUser;
+  if(!fdb || !u) return Promise.reject(new Error('Sin sesión'));
+  var nm = (window.prompt('Nombre con el que aparecen tus horas anteriores:', 'Adiel Palacios')||'').trim() || 'Adiel Palacios';
+  var uid = u.uid, total = 0, now = new Date().toISOString(), idMap = {};
+  function getAll(c){ return fdb.collection(c).get().then(function(sn){ return sn.docs.map(function(d){ return { id:d.id, data:d.data() }; }); }); }
+  return Promise.all([getAll('projects'), getAll('expenses'), getAll('hours'), getAll('advances')]).then(function(res){
+    /* Los proyectos ya migrados/nuevos tienen ownerUid; los anteriores no. */
+    var projects = res[0].filter(function(r){ return !r.data.ownerUid; });
+    var expenses = res[1], hours = res[2], advances = res[3];
+    var chain = Promise.resolve();
+    projects.forEach(function(pr){
+      chain = chain.then(function(){
+        var pref = fdb.collection('projects').doc();
+        idMap[pr.id] = pref.id;
+        return pref.set(Object.assign({}, pr.data, { ownerUid: uid, migratedFrom: pr.id }))
+          .then(function(){ return pref.collection('members').doc(uid).set({ role:'admin', name:nm, email:(u.email||''), code:'', joinedAt:now }); })
+          .then(function(){ return fdb.collection('users').doc(uid).collection('myProjects').doc(pref.id).set({ role:'admin' }); });
+      });
+    });
+    function put(list, col, fix){
+      list.forEach(function(r){
+        chain = chain.then(function(){
+          var npid = idMap[r.data.projectId]; if(!npid) return null;
+          total++;
+          var body = fix(r.data); body.projectId = npid;
+          return fdb.collection('projects').doc(npid).collection(col).doc(r.id).set(body);
+        });
+      });
+    }
+    put(expenses, 'expenses', function(d){ return Object.assign({}, d, { ownerUid: uid, person: d.person || nm }); });
+    put(hours, 'hours', function(d){ var who = d.person || nm; return Object.assign({}, d, { person: who, ownerUid: (who===nm ? uid : '') }); });
+    put(advances, 'advances', function(d){ return Object.assign({}, d, { person:'', toUid:'' }); });
+    return chain;
+  }).then(function(){ try{ localStorage.setItem('viaticosux_migrated','1'); }catch(e){} return total; });
+}
+document.addEventListener('click', function(e){
+  var t = e.target;
+  var btn = t.closest && t.closest('#authLoginBtn, #authSignupBtn, #authResetBtn, #logoutBtn, #migrateBtn');
+  if(!btn) return;
+  var auth = (typeof firebase!=='undefined' && firebase.auth) ? firebase.auth() : null;
+  if(!auth) return;
+  var email = (document.getElementById('authEmail')||{}).value;
+  var pass = (document.getElementById('authPass')||{}).value;
+  email = (email||'').trim();
+  if(btn.id==='authLoginBtn' || btn.id==='authSignupBtn'){
+    if(!email || !pass){ authErr('Escribe correo y contraseña.'); return; }
+    authErr(''); btn.disabled = true;
+    var nameVal = ((document.getElementById('authName')||{}).value||'').trim();
+    if(btn.id==='authSignupBtn' && !nameVal){ authErr('Escribe tu nombre para crear la cuenta.'); return; }
+    var pr = btn.id==='authLoginBtn' ? auth.signInWithEmailAndPassword(email, pass)
+      : auth.createUserWithEmailAndPassword(email, pass).then(function(cred){ return cred.user.updateProfile({ displayName: nameVal }); });
+    pr.then(function(){ btn.disabled = false; }).catch(function(err){ btn.disabled = false; authErr(authMsg(err)); });
+    return;
+  }
+  if(btn.id==='authResetBtn'){
+    if(!email){ authErr('Escribe tu correo arriba y vuelve a pulsar.'); return; }
+    auth.sendPasswordResetEmail(email).then(function(){ authErr('Te enviamos un correo para restablecer la contraseña (revisa también spam).', true); })
+      .catch(function(err){ authErr(authMsg(err)); });
+    return;
+  }
+  if(btn.id==='logoutBtn'){
+    auth.signOut().then(function(){ location.reload(); });
+    return;
+  }
+  if(btn.id==='migrateBtn'){
+    var done = false; try{ done = localStorage.getItem('viaticosux_migrated')==='1'; }catch(e){}
+    if(!confirm(done ? 'Ya importaste datos en este dispositivo. Volver a importar DUPLICARÍA los proyectos. ¿Continuar de todos modos?' : 'Esto copia los datos de la base anterior a TU cuenta actual (como administrador). ¿Continuar?')) return;
+    btn.disabled = true; btn.textContent = 'Importando…';
+    legacyMigrate().then(function(n){ btn.textContent = 'Listo: '+n+' registros importados'; })
+      .catch(function(err){ console.error(err); btn.disabled = false; btn.textContent = 'Importar datos anteriores'; alertBanner('No se pudo importar: '+(err && err.code ? err.code : 'error')); });
+  }
+});
+
+/* ================= Capa de datos multiusuario (Firebase) =================
+   Estructura:
+   users/{uid}/myProjects/{pid}            -> puntero a mis proyectos
+   projects/{pid}                           -> datos del proyecto (ownerUid)
+   projects/{pid}/members/{uid}             -> {role, name, email}
+   projects/{pid}/expenses|hours|advances   -> registros (ownerUid / toUid)
+   projects/{pid}/invites/{code}            -> invitaciones (solo administrador)
+   inviteLookup/{code}                      -> {projectId, role} (consulta por código)  */
+function fbRef(){ return window.__fdb; }
+function projRef(pid){ return fbRef().collection('projects').doc(pid); }
+function ptrRef(pid){ return fbRef().collection('users').doc(myUid()).collection('myProjects').doc(pid); }
+function recProject(col, id){
+  var rec = byId(state[col], id);
+  return rec ? byId(state.projects, rec.projectId) : null;
+}
+function fbAdd(col, data){
+  var body = Object.assign({}, data, { createdAt: new Date().toISOString() });
+  if(col==='projects'){
+    body.ownerUid = myUid();
+    var nm = defaultMyName();
+    return fbRef().collection('projects').add(body).then(function(ref){
+      var pid = ref.id;
+      return projRef(pid).collection('members').doc(myUid()).set({ role:'admin', name:nm, email:(window.__authUser.email||''), code:'', joinedAt:new Date().toISOString() })
+        .then(function(){ return ptrRef(pid).set({ role:'admin' }); })
+        .then(function(){ return pid; });
+    });
+  }
+  var p = byId(state.projects, body.projectId);
+  if(!p) return Promise.reject(new Error('Proyecto no encontrado'));
+  if(col==='hours' || col==='expenses'){
+    if(!isStaffRole(p)){ body.person = myName(p); body.ownerUid = myUid(); }
+    else {
+      if(!body.person) body.person = myName(p);
+      if(body.ownerUid===undefined) body.ownerUid = ownerUidFor(p, body.person);
+    }
+  } else if(col==='advances'){
+    body.person = body.person || '';
+    body.toUid = body.person ? ownerUidFor(p, body.person) : '';
+  }
+  return projRef(p.id).collection(col).add(body).then(function(ref){ return ref.id; });
+}
+function fbUpdate(col, id, data){
+  data = Object.assign({}, data);
+  if(col==='projects'){
+    var p0 = byId(state.projects, id);
+    if(data.people && p0){
+      var ln = linkedNames(p0);
+      data.people = data.people.filter(function(n){ return ln.indexOf(n)===-1; });
+    }
+    return projRef(id).update(data);
+  }
+  var rec = byId(state[col], id);
+  if(!rec) return Promise.reject(new Error('Registro no encontrado'));
+  var p = byId(state.projects, rec.projectId);
+  if(data.person!==undefined && (col==='hours'||col==='expenses') && isStaffRole(p)) data.ownerUid = ownerUidFor(p, data.person);
+  return projRef(rec.projectId).collection(col).doc(id).update(data);
+}
+function fbDelete(col, id){
+  if(col==='projects'){
+    var pid = id, uid = myUid(), base = projRef(pid), chain = Promise.resolve();
+    (state.invites[pid]||[]).forEach(function(iv){
+      chain = chain.then(function(){ return fbRef().collection('inviteLookup').doc(iv.id).delete(); })
+                   .then(function(){ return base.collection('invites').doc(iv.id).delete(); });
+    });
+    (state.members[pid]||[]).forEach(function(m){
+      if(m.uid===uid) return;
+      chain = chain.then(function(){ return base.collection('members').doc(m.uid).delete(); });
+    });
+    return chain.then(function(){ return base.delete(); })
+      .then(function(){ return base.collection('members').doc(uid).delete(); })
+      .then(function(){ return ptrRef(pid).delete(); });
+  }
+  var rec = byId(state[col], id);
+  if(!rec) return Promise.resolve();
+  return projRef(rec.projectId).collection(col).doc(id).delete();
+}
+
+function startFirebase(user, fdb){
+  window.__fbmode = true; window.__fdb = fdb; usingLocal = false;
+  var uid = user.uid;
+  var buckets = { expenses:{}, hours:{}, advances:{} }, projDocs = {}, watchers = {};
+  function flush(col){
+    var arr = []; Object.keys(buckets[col]).forEach(function(pid){ arr = arr.concat(buckets[col][pid]); });
+    onCollectionUpdate(col, arr);
+  }
+  function flushProjects(){ onCollectionUpdate('projects', Object.keys(projDocs).map(function(k){ return projDocs[k]; })); }
+  function stopW(pid){
+    var w = watchers[pid];
+    if(w){ w.unsubs.forEach(function(u){ u(); }); (w.dataUnsubs||[]).forEach(function(u){ u(); }); }
+    delete watchers[pid]; delete projDocs[pid];
+    ['expenses','hours','advances'].forEach(function(c){ delete buckets[c][pid]; });
+    delete state.roles[pid]; delete state.members[pid]; delete state.invites[pid]; delete state.me[pid];
+  }
+  function dropPointer(pid){ stopW(pid); flushProjects(); ['expenses','hours','advances'].forEach(flush); ptrRef(pid).delete().catch(function(){}); }
+  function startData(pid, role){
+    var w = watchers[pid]; if(!w) return;
+    (w.dataUnsubs||[]).forEach(function(u){ u(); }); w.dataUnsubs = [];
+    var base = projRef(pid), staff = (role==='admin' || role==='capturista');
+    function listen(col, q){
+      w.dataUnsubs.push(q.onSnapshot(function(snap){
+        buckets[col][pid] = snap.docs.map(function(d){ return Object.assign({id:d.id, projectId:pid}, d.data()); });
+        flush(col);
+      }, function(err){ console.error(col, err); buckets[col][pid] = []; flush(col); }));
+    }
+    listen('expenses', staff ? base.collection('expenses') : base.collection('expenses').where('ownerUid','==',uid));
+    listen('hours', staff ? base.collection('hours') : base.collection('hours').where('ownerUid','==',uid));
+    listen('advances', role==='admin' ? base.collection('advances') : base.collection('advances').where('toUid','==',uid));
+    if(staff){
+      w.dataUnsubs.push(base.collection('members').onSnapshot(function(snap){
+        state.members[pid] = snap.docs.map(function(d){ return Object.assign({uid:d.id}, d.data()); });
+        render();
+      }, function(err){ console.error('members', err); }));
+    }
+    if(role==='admin'){
+      w.dataUnsubs.push(base.collection('invites').onSnapshot(function(snap){
+        state.invites[pid] = snap.docs.map(function(d){ return Object.assign({id:d.id}, d.data()); });
+        render();
+      }, function(err){ console.error('invites', err); }));
+    }
+  }
+  function watch(pid){
+    if(watchers[pid]) return;
+    var w = watchers[pid] = { unsubs:[], dataUnsubs:[] };
+    var base = projRef(pid);
+    w.unsubs.push(base.onSnapshot(function(snap){
+      if(!snap.exists){ dropPointer(pid); return; }
+      projDocs[pid] = Object.assign({id:pid}, snap.data());
+      flushProjects();
+    }, function(err){ console.error('project', pid, err); dropPointer(pid); }));
+    w.unsubs.push(base.collection('members').doc(uid).onSnapshot(function(snap){
+      if(!snap.exists){ dropPointer(pid); return; }
+      var d = snap.data(), prev = state.roles[pid];
+      state.me[pid] = { role:d.role, name:d.name };
+      state.roles[pid] = d.role;
+      if(prev!==d.role) startData(pid, d.role);
+      render();
+    }, function(err){ console.error('me', pid, err); dropPointer(pid); }));
+  }
+  fdb.collection('users').doc(uid).collection('myProjects').onSnapshot(function(snap){
+    var ids = snap.docs.map(function(d){ return d.id; });
+    ids.forEach(watch);
+    Object.keys(watchers).filter(function(p){ return ids.indexOf(p)===-1; }).forEach(stopW);
+    flushProjects(); ['expenses','hours','advances'].forEach(flush);
+    var m = /#unirme=([A-Za-z0-9]+)/.exec(location.hash||'');
+    if(m && !window.__joinShown){ window.__joinShown = true; openModal('joinProject', { code: m[1] }); }
+  }, function(err){ console.error('pointers', err); alertBanner('No se pudo cargar tus proyectos.'); });
+}
+
+function newInviteCode(){
+  var A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789', out = '', arr = new Uint8Array(10);
+  (window.crypto || window.msCrypto).getRandomValues(arr);
+  for(var i=0;i<arr.length;i++) out += A[arr[i] % A.length];
+  return out;
+}
+function inviteLink(code){ return location.origin + location.pathname + '#unirme=' + code; }
+function createInvite(pid, role){
+  var code = newInviteCode(), now = new Date().toISOString();
+  return fbRef().collection('inviteLookup').doc(code).set({ projectId:pid, role:role, createdBy:myUid() })
+    .then(function(){ return projRef(pid).collection('invites').doc(code).set({ role:role, createdAt:now, createdBy:myUid() }); })
+    .then(function(){ return code; });
+}
+function revokeInvite(pid, code){
+  return fbRef().collection('inviteLookup').doc(code).delete()
+    .then(function(){ return projRef(pid).collection('invites').doc(code).delete(); });
+}
+function joinProject(code, name){
+  code = (code||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+  if(code.length<6) return Promise.reject({ message:'Escribe el código completo.' });
+  var fdb = fbRef(), uid = myUid();
+  return fdb.collection('inviteLookup').doc(code).get().then(function(snap){
+    if(!snap.exists) throw { message:'Código no válido o ya revocado.' };
+    var inv = snap.data(), pid = inv.projectId, mref = projRef(pid).collection('members').doc(uid);
+    return mref.get().then(function(ms){
+      var p = ms.exists ? Promise.resolve() : mref.set({ role:inv.role, name:name, email:(window.__authUser.email||''), code:code, joinedAt:new Date().toISOString() });
+      return p.then(function(){ return ptrRef(pid).set({ role:inv.role }); }).then(function(){ return pid; });
+    });
+  });
 }
 
 function initStore(){
@@ -772,11 +1113,25 @@ function initStore(){
     try{
       var app = firebase.apps && firebase.apps.length ? firebase.apps[0] : firebase.initializeApp(FIREBASE_CONFIG);
       var auth = firebase.auth();
+      var started = false;
       auth.onAuthStateChanged(function(user){
-        if(user){ goSynced(firebase.firestore(), 'Sincronizado (Firebase)'); }
+        if(user && user.isAnonymous){ auth.signOut(); return; }
+        if(user){
+          window.__authUser = user;
+          hideLogin();
+          var sub = document.getElementById('brandSub'); if(sub) sub.textContent = user.email || '';
+          if(!started){
+            started = true;
+            var fdb = firebase.firestore();
+            var pill = document.getElementById('syncDot'); if(pill) pill.classList.remove('local');
+            var lbl = document.getElementById('syncLabel'); if(lbl) lbl.textContent = 'Sincronizado';
+            startFirebase(user, fdb);
+          }
+        } else {
+          window.__authUser = null;
+          showLogin();
+        }
       });
-      auth.signInAnonymously().catch(function(err){ console.error('firebase auth', err); goLocal(); });
-      setTimeout(function(){ if(!state.loaded.projects && !dbCap) goLocal(); }, 6000);
     }catch(e){ console.error('firebase init', e); goLocal(); }
   };
   try{
@@ -1276,6 +1631,68 @@ function renderChips(){
   html += '<div class="chip add" data-open-modal="newProject">+ Nuevo proyecto</div>';
   wrap.innerHTML = html;
 }
+/* ================= Tipo de cambio FIX (Banxico, serie SF43718) ================= */
+function isoAddDays(iso, n){ var d = parseISODate(iso); d.setDate(d.getDate()+n); return toISODate(d); }
+function banxicoToISO(f){
+  if(/^\d{4}-\d{2}-\d{2}/.test(f)) return f.slice(0,10);
+  var m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(f||'');
+  return m ? m[3]+'-'+pad2(+m[2])+'-'+pad2(+m[1]) : null;
+}
+function fixCacheGet(k){ try{ var v = localStorage.getItem('viaticosux_fix_'+k); return v ? JSON.parse(v) : null; }catch(e){ return null; } }
+function fixCacheSet(k, v){ try{ localStorage.setItem('viaticosux_fix_'+k, JSON.stringify(v)); }catch(e){} }
+/* Devuelve {value, date}: el último FIX publicado en o antes de dateISO
+   (fines de semana y festivos toman el FIX anterior). */
+function fetchFix(dateISO){
+  if(!BANXICO_TOKEN) return Promise.reject({ code:'no-token' });
+  var c = fixCacheGet(dateISO); if(c) return Promise.resolve(c);
+  var url = 'https://www.banxico.org.mx/SieAPIRest/service/v1/series/SF43718/datos/' + isoAddDays(dateISO,-10) + '/' + dateISO + '?token=' + encodeURIComponent(BANXICO_TOKEN);
+  return fetch(url).then(function(r){
+    if(!r.ok) throw { code:'http-'+r.status };
+    return r.json();
+  }).then(function(j){
+    var datos = (((j||{}).bmx||{}).series||[{}])[0].datos || [];
+    var best = null;
+    datos.forEach(function(d){
+      var iso = banxicoToISO(d.fecha), v = parseFloat(String(d.dato).replace(/,/g,''));
+      if(!iso || !isFinite(v) || iso > dateISO) return;
+      if(!best || iso > best.date) best = { value: v, date: iso };
+    });
+    if(!best) throw { code:'no-data' };
+    fixCacheSet(dateISO, best);
+    return best;
+  });
+}
+var fxReq = 0;
+function autoFx(){
+  if(state.currentTab!=='gastos' || state.expenseCurrency!=='USD') return;
+  var fxEl = document.getElementById('expFx'), dEl = document.getElementById('expDate'), hint = document.getElementById('expFxHint');
+  if(!fxEl || !dEl || !hint) return;
+  if(!BANXICO_TOKEN){ hint.textContent = 'T/C manual (sin token de Banxico configurado).'; return; }
+  var date = dEl.value || todayISO(), my = ++fxReq;
+  hint.textContent = 'Consultando FIX de Banxico…';
+  fetchFix(date).then(function(r){
+    if(my!==fxReq) return;
+    state.fxAuto = r;
+    var fxEl2 = document.getElementById('expFx'), hint2 = document.getElementById('expFxHint');
+    if(!fxEl2 || !hint2) return;
+    var shown = r.date.split('-').reverse().join('/');
+    if(!state.fxManual){
+      fxEl2.value = r.value;
+      var amt = parseFloat((document.getElementById('expAmount')||{}).value)||0;
+      var pv = document.getElementById('fxPreview');
+      if(pv) pv.innerHTML = 'Equivalente: <b>'+ (amt*r.value).toLocaleString('es-MX',{minimumFractionDigits:2,maximumFractionDigits:2}) +' MXN</b>';
+      hint2.textContent = 'FIX Banxico del '+shown+': '+r.value.toFixed(4)+' (puedes editarlo).';
+    } else {
+      hint2.textContent = 'Editado a mano. FIX Banxico del '+shown+': '+r.value.toFixed(4)+'.';
+    }
+  }).catch(function(err){
+    if(my!==fxReq) return;
+    console.error('fix', err);
+    var h = document.getElementById('expFxHint'); if(!h) return;
+    h.textContent = 'No se pudo consultar Banxico ('+((err&&err.code)||'sin conexión o bloqueado')+'). Escribe el T/C a mano.';
+  });
+}
+
 function renderContent(){
   var el = document.getElementById('content');
   var body = '<div id="flashBanner" style="display:none;background:var(--surface-3);color:var(--text);font-size:12.5px;padding:9px 12px;border-radius:10px;margin-bottom:12px;text-align:center;"></div>';
@@ -1296,6 +1713,7 @@ function renderContent(){
   else if(state.currentTab==='resumen') body += renderResumen();
 
   el.innerHTML = body;
+  if(state.currentTab==='gastos' && state.expenseCurrency==='USD') setTimeout(autoFx, 0);
 }
 
 function emptyState(icon, title, sub){
@@ -1308,6 +1726,7 @@ function renderOnboarding(){
     '<h3 style="font-size:17px;">Registra tus viáticos y gastos desde el celular</h3>'+
     '<p style="font-size:13.5px;color:var(--text-muted);margin-top:8px;line-height:1.5;">Crea tu primer proyecto para empezar a capturar gastos, horas y abonos, igual que en tus reportes de Excel — pero desde tu iPhone, en el momento en que ocurre el gasto.</p>'+
     '<button class="btn accent block" style="margin-top:16px;" data-open-modal="newProject">Crear primer proyecto</button>'+
+    (fbMode() ? '<button class="btn block" style="margin-top:10px;" data-open-modal="joinProject">Unirme a un proyecto con código</button>' : '')+
     '</div>';
 }
 
@@ -1325,6 +1744,10 @@ function renderGastos(){
   html += '<div class="field"><label>Moneda</label><div class="segmented"><button type="button" class="'+(cur==='MXN'?'active':'')+'" data-set-currency="MXN">MXN</button><button type="button" class="'+(cur==='USD'?'active':'')+'" data-set-currency="USD">USD</button></div></div>';
   html += '</div>';
 
+  var gPeople = peopleFor(p);
+  if(isStaffRole(p) && gPeople.length>1){
+    html += '<div class="field" style="margin-top:10px;"><label>Gasto de</label><select class="input" id="expPerson">'+gPeople.map(function(n){ return '<option value="'+esc(n)+'" '+(n===myName(p)?'selected':'')+'>'+esc(n)+'</option>'; }).join('')+'</select></div>';
+  }
   html += '<div class="field" style="margin-top:10px;"><label>Categoría</label><select class="input" id="expCategory">';
   cats.forEach(function(c){ html += '<option value="'+esc(c)+'">'+esc(c)+'</option>'; });
   html += '</select></div>';
@@ -1332,7 +1755,7 @@ function renderGastos(){
   html += '<div class="field-row" style="margin-top:10px;">';
   html += '<div class="field"><label>Monto ('+cur+')</label><input class="input num" type="number" inputmode="decimal" step="0.01" min="0" id="expAmount" placeholder="0.00"></div>';
   if(cur==='USD'){
-    html += '<div class="field"><label>T/C (MXN por USD)</label><input class="input num" type="number" inputmode="decimal" step="0.0001" min="0" id="expFx" value="'+(p.lastFx||17.3)+'"></div>';
+    html += '<div class="field"><label>T/C (MXN por USD)</label><input class="input num" type="number" inputmode="decimal" step="0.0001" min="0" id="expFx" value="'+(p.lastFx||17.3)+'"><div class="hint" id="expFxHint"></div></div>';
   }
   html += '</div>';
   if(cur==='USD'){
@@ -1359,7 +1782,7 @@ function renderGastos(){
       var d = parseISODate(e.date);
       html += '<div class="row-item" data-edit-expense="'+e.id+'">';
       html += '<div class="row-date"><div class="d">'+pad2(d.getDate())+'</div><div class="m">'+MONTHS[d.getMonth()]+'</div></div>';
-      html += '<div class="row-mid"><div class="cat">'+esc(canonicalCategory(e.category))+(e.photo?' <span title="Tiene foto adjunta" style="font-size:12px;">📷</span>':'')+'</div>'+(e.note?'<div class="note">'+esc(e.note)+'</div>':'')+'</div>';
+      html += '<div class="row-mid"><div class="cat">'+esc(canonicalCategory(e.category))+(e.photo?' <span title="Tiene foto adjunta" style="font-size:12px;">📷</span>':'')+'</div>'+((fbMode()&&isStaffRole(p)&&e.person)?'<div class="note">'+esc(e.person)+(e.note?' · '+esc(e.note):'')+'</div>':(e.note?'<div class="note">'+esc(e.note)+'</div>':''))+'</div>';
       html += '<div class="row-amt"><div class="a">'+fmtMoney(e.currency==='USD'?e.amount:e.mxn, e.currency==='USD'?'USD':'MXN')+'</div>'+(e.currency==='USD'?'<div class="c">≈ $'+(e.mxn||0).toLocaleString('es-MX',{minimumFractionDigits:2,maximumFractionDigits:2})+' MXN</div>':'<div class="c">MXN</div>')+'</div>';
       html += '</div>';
     });
@@ -1460,8 +1883,9 @@ function renderHoras(){
     html += '</div>';
   }
 
+  html += tmrCard(p, people, activePerson);
   html += '<div class="card">';
-  html += '<div class="section-title" style="margin-top:0;">Registrar horas · '+esc(p.name)+'</div>';
+  html += '<div class="section-title" style="margin-top:0;">Registrar horas manualmente · '+esc(p.name)+'</div>';
   html += '<div class="field-row">';
   html += '<div class="field"><label>Fecha</label><input class="input" type="date" id="hrsDate" value="'+todayISO()+'"></div>';
   if(people.length>1){
@@ -1481,11 +1905,15 @@ function renderHoras(){
   html += '<div class="field" style="margin-top:10px;"><label>Actividad / Notas</label><input class="input" type="text" id="hrsActivity" placeholder="Ej. PLC Support, comisionado línea 3" maxlength="160"></div>';
   html += '<label style="display:flex;align-items:center;gap:7px;margin-top:10px;font-size:12.5px;color:var(--text-muted);"><input type="checkbox" id="hrsManualToggle" '+(state.hoursManual?'checked':'')+'> Ingresar horas manualmente (sin horario)</label>';
   html += '<button class="btn accent block" style="margin-top:14px;" id="saveHoursBtn">Guardar horas</button>';
-  html += '<button class="btn sm ghost" type="button" id="hrsAddPersonToggle" style="margin-top:8px;">+ Agregar otra persona al proyecto</button>';
-  html += '<div id="hrsAddPersonRow" style="display:none;margin-top:8px;" class="field-row"><input class="input" type="text" id="hrsNewPersonInput" placeholder="Nombre" style="flex:1;"><button class="btn sm" type="button" id="hrsAddPersonBtn">Añadir</button></div>';
-  if(people.length>1){
-    html += '<button class="btn sm ghost" type="button" data-open-modal="copyHours" data-project="'+p.id+'" style="margin-top:8px;">Copiar horas entre personas</button>';
-    html += '<button class="btn sm ghost" type="button" data-open-modal="removePerson" data-project="'+p.id+'" style="margin-top:6px;">Quitar una persona del proyecto</button>';
+  if(isStaffRole(p)){
+    html += '<button class="btn sm ghost" type="button" id="hrsAddPersonToggle" style="margin-top:8px;">+ Agregar persona sin cuenta</button>';
+    html += '<div id="hrsAddPersonRow" style="display:none;margin-top:8px;" class="field-row"><input class="input" type="text" id="hrsNewPersonInput" placeholder="Nombre" style="flex:1;"><button class="btn sm" type="button" id="hrsAddPersonBtn">Añadir</button></div>';
+    if(people.length>1){
+      html += '<button class="btn sm ghost" type="button" data-open-modal="copyHours" data-project="'+p.id+'" style="margin-top:8px;">Copiar horas entre personas</button>';
+    }
+    if(people.length>1 && (!fbMode() || unlinkedPeople(p).length)){
+      html += '<button class="btn sm ghost" type="button" data-open-modal="removePerson" data-project="'+p.id+'" style="margin-top:6px;">Quitar una persona'+(fbMode()?' sin cuenta':' del proyecto')+'</button>';
+    }
   }
   html += '</div>';
 
@@ -1526,6 +1954,37 @@ function renderHoras(){
 }
 
 /* ================= Tab: Resumen ================= */
+
+function personTable(p, expenses, advances){
+  var names = peopleFor(p).slice();
+  var me = myName(p);
+  function key(n){ return n || me; }
+  var rows = {};
+  names.forEach(function(n){ rows[n] = { h:0, g:0, a:0 }; });
+  state.hours.filter(function(h){ return h.projectId===p.id; }).forEach(function(h){
+    var n = key(h.person); if(!rows[n]) rows[n] = {h:0,g:0,a:0}; rows[n].h += (h.hours||0);
+  });
+  expenses.forEach(function(e){ var n = key(e.person); if(!rows[n]) rows[n] = {h:0,g:0,a:0}; rows[n].g += (e.mxn||0); });
+  var general = 0;
+  advances.forEach(function(a){
+    if(!a.person){ general += (a.amount||0); return; }
+    if(!rows[a.person]) rows[a.person] = {h:0,g:0,a:0}; rows[a.person].a += (a.amount||0);
+  });
+  var list = Object.keys(rows);
+  if(list.length<=1 && !general) return '';
+  var h = '<div style="margin-top:12px;"><div class="lbl" style="font-size:11.5px;color:var(--text-faint);margin-bottom:6px;">POR PERSONA</div>';
+  h += '<div style="display:grid;grid-template-columns:1.4fr .7fr 1fr 1fr 1fr;gap:4px 8px;font-size:12px;align-items:center;">';
+  ['Persona','Horas','Gastado','Abonado','Saldo'].forEach(function(t){ h += '<div style="color:var(--text-muted);font-weight:600;">'+t+'</div>'; });
+  list.forEach(function(n){
+    var r = rows[n], saldo = r.g - r.a;
+    h += '<div>'+esc(n)+'</div><div class="num">'+r.h.toFixed(1)+'</div><div class="num">'+fmtMoney(r.g,'MXN')+'</div><div class="num">'+fmtMoney(r.a,'MXN')+'</div>';
+    h += '<div class="num" style="color:'+(saldo>0?'var(--bad)':'var(--good)')+'">'+fmtMoney(Math.abs(saldo),'MXN')+(saldo<0?' a favor':'')+'</div>';
+  });
+  if(general){ h += '<div>(Abonos sin persona)</div><div></div><div></div><div class="num">'+fmtMoney(general,'MXN')+'</div><div></div>'; }
+  h += '</div><div class="hint">Saldo = gastado − abonado. Positivo: se le debe reponer a la persona.</div></div>';
+  return h;
+}
+
 function renderResumen(){
   var all = activeProjects();
   var monday = state.weekStart;
@@ -1591,17 +2050,23 @@ function renderResumen(){
     html += '<div class="pf"><div class="lbl">Abonado</div><div class="val">'+fmtMoney(abonado,'MXN')+'</div></div>';
     html += '<div class="pf"><div class="lbl">Saldo</div><div class="val" style="color:'+(saldo>0?'var(--bad)':'var(--good)')+'">'+fmtMoney(Math.abs(saldo),'MXN')+(saldo<0?' a favor':'')+'</div></div>';
     html += '</div>';
+    var admin = isAdminRole(p);
+    if(fbMode()) html += '<div class="hint" style="margin:0 0 8px;">Tu rol: <b style="color:var(--text)">'+ROLE_LABELS[myRole(p)]+'</b>'+(myRole(p)==='integrante'?' · se muestran solo tus datos':'')+'</div>';
     html += '<div class="proj-actions">';
-    html += '<button class="btn sm accent" data-open-modal="newAdvance" data-project="'+p.id+'">+ Abono</button>';
+    if(admin) html += '<button class="btn sm accent" data-open-modal="newAdvance" data-project="'+p.id+'">+ Abono</button>';
     html += '<button class="btn sm" data-open-modal="viewAdvances" data-project="'+p.id+'">Ver abonos ('+advances.length+')</button>';
-    html += '<button class="btn sm" data-open-modal="editProject" data-project="'+p.id+'">Editar</button>';
+    if(admin) html += '<button class="btn sm" data-open-modal="editProject" data-project="'+p.id+'">Editar</button>';
+    if(fbMode() && admin) html += '<button class="btn sm" data-open-modal="team" data-project="'+p.id+'">Equipo e invitaciones</button>';
     html += '<button class="btn sm" data-export-csv="'+p.id+'">Exportar CSV</button>';
     html += '<button class="btn sm" data-export-gastos-xlsx="'+p.id+'">Exportar gastos (Excel)</button>';
     html += '<button class="btn sm" data-export-hours="'+p.id+'">Exportar horas (Excel)</button>';
-    html += '</div></div>';
+    html += '</div>';
+    if(fbMode() && isStaffRole(p)) html += personTable(p, expenses, advances);
+    html += '</div>';
   });
 
   html += '<button class="btn block" style="margin-top:16px;" data-open-modal="newProject">+ Nuevo proyecto</button>';
+  if(fbMode()) html += '<button class="btn block ghost" style="margin-top:8px;" data-open-modal="joinProject">Unirme a un proyecto con código</button>';
 
   var archived = state.projects.filter(function(p){return p.archived;});
   if(archived.length){
@@ -1612,10 +2077,73 @@ function renderResumen(){
       html += '<button class="btn sm" data-unarchive="'+p.id+'">Reactivar</button></div>';
     });
   }
+  if(window.__authUser){
+    html += '<div class="card" style="margin-top:18px;"><div class="section-title" style="margin-top:0;">Cuenta</div>';
+    html += '<div class="hint" style="margin:0 0 10px;">Sesión: '+esc(window.__authUser.email||'')+'</div>';
+    html += '<button class="btn sm ghost" type="button" id="logoutBtn">Cerrar sesión</button>';
+    if(location.hash==='#migrar') html += '<button class="btn sm block" type="button" id="migrateBtn" style="margin-top:10px;">Importar datos anteriores</button>';
+    html += '</div>';
+  }
   return html;
 }
 
 /* ================= Modals ================= */
+
+function modalTeam(pid){
+  var p = byId(state.projects, pid);
+  if(!p) return '';
+  var members = (state.members[pid]||[]).slice().sort(function(a,b){ return (a.name||'').localeCompare(b.name||''); });
+  var invites = (state.invites[pid]||[]).slice().sort(function(a,b){ return (b.createdAt||'').localeCompare(a.createdAt||''); });
+  var html = '<div class="modal-head"><h2>Equipo · '+esc(p.name)+'</h2><button class="modal-close" data-close-modal="1">✕</button></div>';
+  html += '<div class="section-title" style="margin-top:0;">Integrantes con cuenta</div>';
+  html += '<div class="card" style="padding:8px 14px;">';
+  members.forEach(function(m){
+    var self = m.uid===myUid();
+    html += '<div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);flex-wrap:wrap;">';
+    html += '<div style="flex:1;min-width:120px;"><div style="font-weight:600;font-size:13.5px;">'+esc(m.name||'(sin nombre)')+(self?' (tú)':'')+'</div><div class="hint" style="margin:0;">'+esc(m.email||'')+'</div></div>';
+    if(self){
+      html += '<span class="tag">'+ROLE_LABELS[m.role]+'</span>';
+    } else {
+      html += '<select class="input" data-member-role="'+m.uid+'" style="width:auto;">'+['integrante','capturista','admin'].map(function(r){ return '<option value="'+r+'" '+(m.role===r?'selected':'')+'>'+ROLE_LABELS[r]+'</option>'; }).join('')+'</select>';
+      html += '<button class="btn sm danger" data-member-remove="'+m.uid+'">Quitar</button>';
+    }
+    html += '</div>';
+  });
+  html += '</div>';
+  html += '<div class="hint">Administrador: ve y edita todo y registra abonos. Capturista: captura gastos y horas de cualquiera, sin ver abonos. Integrante: solo ve y captura lo suyo.</div>';
+  var un = unlinkedPeople(p);
+  if(un.length) html += '<div class="hint" style="margin-top:8px;">Personas sin cuenta (solo con horas capturadas por otros): '+un.map(esc).join(', ')+'</div>';
+  html += '<div class="section-title">Invitar a una persona</div>';
+  html += '<div class="field-row"><div class="field"><label>Rol</label><select class="input" id="tmInvRole"><option value="integrante">Integrante</option><option value="capturista">Capturista</option><option value="admin">Administrador</option></select></div></div>';
+  html += '<button class="btn accent block" style="margin-top:10px;" id="tmInvBtn" data-project="'+pid+'">Generar código de invitación</button>';
+  if(invites.length){
+    html += '<div class="section-title">Invitaciones activas</div><div class="card" style="padding:8px 14px;">';
+    invites.forEach(function(iv){
+      html += '<div style="padding:8px 0;border-bottom:1px solid var(--border);">';
+      html += '<div style="display:flex;align-items:center;gap:8px;"><div style="flex:1;"><div class="num" style="font-weight:700;letter-spacing:2px;font-size:16px;">'+esc(iv.id)+'</div><div class="hint" style="margin:0;">'+ROLE_LABELS[iv.role]+'</div></div>';
+      html += '<button class="btn sm" data-copy-link="'+esc(iv.id)+'">Copiar enlace</button>';
+      html += '<button class="btn sm danger" data-revoke-invite="'+esc(iv.id)+'">Revocar</button></div></div>';
+    });
+    html += '</div><div class="hint">Cada código sirve para varias personas hasta que lo revoques. Compártelo solo con quien deba entrar al proyecto.</div>';
+  }
+  return html;
+}
+function modalJoin(opts){
+  var html = '<div class="modal-head"><h2>Unirme a un proyecto</h2><button class="modal-close" data-close-modal="1">✕</button></div>';
+  html += '<div class="field"><label>Código de invitación</label><input class="input" type="text" id="jnCode" value="'+esc((opts&&opts.code)||'')+'" placeholder="Ej. K7M2QX9TPA" autocapitalize="characters"></div>';
+  html += '<div class="field" style="margin-top:10px;"><label>Tu nombre en este proyecto</label><input class="input" type="text" id="jnName" value="'+esc(defaultMyName())+'"></div>';
+  html += '<div id="jnError" style="display:none;margin-top:10px;font-size:12.5px;color:var(--bad);"></div>';
+  html += '<button class="btn accent block" style="margin-top:14px;" id="jnBtn">Unirme</button>';
+  return html;
+}
+function copyText(txt, okMsg){
+  function fallback(){ window.prompt('Copia este texto:', txt); }
+  try{
+    if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(txt).then(function(){ alertBanner(okMsg); }, fallback); }
+    else fallback();
+  }catch(e){ fallback(); }
+}
+
 function openModal(name, opts){
   opts = opts || {};
   var root = document.getElementById('modalRoot');
@@ -1623,6 +2151,8 @@ function openModal(name, opts){
   if(name==='newProject') html = modalProjectForm(null);
   else if(name==='editProject') html = modalProjectForm(byId(state.projects, opts.project));
   else if(name==='newAdvance') html = modalAdvanceForm(opts.project);
+  else if(name==='team') html = modalTeam(opts.project);
+  else if(name==='joinProject') html = modalJoin(opts);
   else if(name==='viewAdvances') html = modalViewAdvances(opts.project);
   else if(name==='editExpense') html = modalExpenseForm(byId(state.expenses, opts.expense));
   else if(name==='editHours') html = modalHoursForm(byId(state.hours, opts.hours));
@@ -1671,8 +2201,8 @@ function modalProjectForm(project){
   html += '</div>';
   html += '</div>';
 
-  var people = project ? peopleFor(project) : ['Adiel Palacios'];
-  html += '<div class="field" style="margin-top:14px;"><label>Personas (para el control de horas)</label>';
+  var people = fbMode() ? (project ? unlinkedPeople(project) : []) : (project ? peopleFor(project) : ['Adiel Palacios']);
+  html += '<div class="field" style="margin-top:14px;"><label>'+(fbMode()?'Personas sin cuenta (para el control de horas)':'Personas (para el control de horas)')+'</label>';
   html += '<div id="pjPeople">'+people.map(function(name,i){ return '<span class="cat-chip" data-person="'+esc(name)+'"><span class="dot" style="background:'+PERSON_PALETTE[i%PERSON_PALETTE.length]+';display:inline-block;"></span>'+esc(name)+'<button type="button" data-remove-person="'+esc(name)+'">✕</button></span>'; }).join('')+'</div>';
   html += '<div class="field-row" style="margin-top:8px;"><input class="input" type="text" id="pjNewPerson" placeholder="Nombre de la persona" style="flex:1;"><button class="btn sm" id="pjAddPersonBtn" type="button">Añadir</button></div>';
   html += '<div class="hint">Cada quien queda distinguible por color al registrar horas.</div>';
@@ -1700,7 +2230,11 @@ function modalAdvanceForm(projectId){
   var p = byId(state.projects, projectId);
   var html = '<div class="modal-head"><h2>Registrar abono</h2><button class="modal-close" data-close-modal="1">✕</button></div>';
   html += '<div class="hint" style="margin-bottom:10px;">Proyecto: <b style="color:var(--text)">'+esc(p?p.name:'')+'</b></div>';
-  html += '<div class="field"><label>Fecha</label><input class="input" type="date" id="advDate" value="'+todayISO()+'"></div>';
+  if(fbMode() && p){
+    var rPeople = peopleFor(p);
+    html += '<div class="field"><label>Abono para</label><select class="input" id="advPerson"><option value="">(Proyecto en general)</option>'+rPeople.map(function(n){ return '<option value="'+esc(n)+'">'+esc(n)+'</option>'; }).join('')+'</select></div>';
+  }
+  html += '<div class="field" style="margin-top:10px;"><label>Fecha</label><input class="input" type="date" id="advDate" value="'+todayISO()+'"></div>';
   html += '<div class="field" style="margin-top:10px;"><label>Monto (MXN)</label><input class="input num" type="number" step="0.01" min="0" id="advAmount" placeholder="0.00"></div>';
   html += '<div class="field" style="margin-top:10px;"><label>Tipo de abono</label><div class="segmented" id="advTypeSeg">'+
     '<button type="button" data-advtype="Transferencia" class="active">Transferencia</button>'+
@@ -1725,14 +2259,14 @@ function modalViewAdvances(projectId){
       var d = parseISODate(a.date);
       html += '<div class="row-item">';
       html += '<div class="row-date"><div class="d">'+pad2(d.getDate())+'</div><div class="m">'+MONTHS[d.getMonth()]+'</div></div>';
-      html += '<div class="row-mid"><div class="cat">'+esc(a.method||'Abono')+(a.reference?' · '+esc(a.reference):'')+'</div>'+(a.note?'<div class="note">'+esc(a.note)+'</div>':'')+'</div>';
+      html += '<div class="row-mid"><div class="cat">'+esc(a.method||'Abono')+(a.reference?' · '+esc(a.reference):'')+(a.person?' · para '+esc(a.person):'')+'</div>'+(a.note?'<div class="note">'+esc(a.note)+'</div>':'')+'</div>';
       html += '<div class="row-amt"><div class="a">'+fmtMoney(a.amount,'MXN')+'</div></div>';
-      html += '<button class="btn sm danger" data-delete-advance="'+a.id+'" style="margin-left:6px;">✕</button>';
+      if(isAdminRole(p)) html += '<button class="btn sm danger" data-delete-advance="'+a.id+'" style="margin-left:6px;">✕</button>';
       html += '</div>';
     });
     html += '</div>';
   }
-  html += '<button class="btn accent block" style="margin-top:14px;" data-open-modal="newAdvance" data-project="'+projectId+'">+ Nuevo abono</button>';
+  if(isAdminRole(p)) html += '<button class="btn accent block" style="margin-top:14px;" data-open-modal="newAdvance" data-project="'+projectId+'">+ Nuevo abono</button>';
   return html;
 }
 
@@ -1808,7 +2342,7 @@ function modalCopyHoursForm(project){
 }
 function modalRemovePersonForm(project){
   if(!project) return '';
-  var people = peopleFor(project);
+  var people = fbMode() ? unlinkedPeople(project) : peopleFor(project);
   var html = '<div class="modal-head"><h2>Quitar persona del proyecto</h2><button class="modal-close" data-close-modal="1">✕</button></div>';
   html += '<div class="field"><label>Persona a quitar</label><select class="input" id="rpPerson">'+people.map(function(nm){ return '<option value="'+esc(nm)+'">'+esc(nm)+'</option>'; }).join('')+'</select></div>';
   html += '<div class="hint" id="rpWarning" style="margin-top:8px;"></div>';
@@ -1818,6 +2352,62 @@ function modalRemovePersonForm(project){
 }
 
 /* ================= Event binding ================= */
+
+/* ================= Reloj de jornada (entrada / salida con pausas) ================= */
+function tmrKey(pid, person){ return 'viaticosux_timer_'+pid+'_'+person; }
+function tmrLoad(pid, person){
+  try{ var r = localStorage.getItem(tmrKey(pid,person)); if(r){ var o = JSON.parse(r); if(o && o.segs) return o; } }catch(e){}
+  return { date: todayISO(), segs: [] };
+}
+function tmrSave(pid, person, t){
+  try{
+    if(!t.segs.length) localStorage.removeItem(tmrKey(pid,person));
+    else localStorage.setItem(tmrKey(pid,person), JSON.stringify(t));
+  }catch(e){}
+}
+function tmrMs(t){
+  var now = Date.now();
+  return t.segs.reduce(function(a,sg){ return a + ((sg[1]||now) - sg[0]); }, 0);
+}
+function tmrFmt(ms){
+  var sec = Math.floor(ms/1000), h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), x = sec%60;
+  return (h<10?'0':'')+h+':'+(m<10?'0':'')+m+':'+(x<10?'0':'')+x;
+}
+function tmrClock(ms){
+  var d = new Date(ms);
+  return (d.getHours()<10?'0':'')+d.getHours()+':'+(d.getMinutes()<10?'0':'')+d.getMinutes();
+}
+function tmrCard(p, people, activePerson){
+  var person = (state.timerPerson && people.indexOf(state.timerPerson)!==-1) ? state.timerPerson : activePerson;
+  var t = tmrLoad(p.id, person);
+  var running = t.segs.length && !t.segs[t.segs.length-1][1];
+  var h = '<div class="card">';
+  h += '<div class="section-title" style="margin-top:0;">Reloj de jornada · '+esc(p.name)+'</div>';
+  if(people.length>1){
+    h += '<div class="field"><label>Persona</label><select class="input" id="tmrPerson">'+people.map(function(n){ return '<option value="'+esc(n)+'" '+(n===person?'selected':'')+'>'+esc(n)+'</option>'; }).join('')+'</select></div>';
+  }
+  h += '<div style="text-align:center;margin:12px 0 4px;"><div id="tmrElapsed" data-pid="'+p.id+'" data-person="'+esc(person)+'" style="font-size:38px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:1px;">'+tmrFmt(tmrMs(t))+'</div>';
+  h += '<div class="hint">'+(running?'Contando… (en curso)':(t.segs.length?'En pausa / detenido':'Sin iniciar'))+(t.segs.length && t.date!==todayISO()?' · día '+esc(t.date):'')+'</div></div>';
+  if(running){
+    h += '<button class="btn accent block" style="margin-top:10px;" id="tmrStopBtn">⏸ Salida / Parar</button>';
+  } else {
+    h += '<button class="btn accent block" style="margin-top:10px;" id="tmrStartBtn">'+(t.segs.length?'▶ Regresé (nuevo conteo)':'▶ Entrada (iniciar jornada)')+'</button>';
+  }
+  if(t.segs.length){
+    h += '<div style="margin-top:10px;font-size:12.5px;color:var(--text-muted);">';
+    t.segs.forEach(function(sg,i){
+      h += '<div>Tramo '+(i+1)+': '+tmrClock(sg[0])+' → '+(sg[1]?tmrClock(sg[1]):'…')+(sg[1]?' · '+(((sg[1]-sg[0])/3600000).toFixed(2))+' h':'')+'</div>';
+    });
+    h += '</div>';
+    h += '<div class="field" style="margin-top:10px;"><label>Actividad / Notas</label><input class="input" type="text" id="tmrActivity" placeholder="Ej. PLC Support, comisionado línea 3" maxlength="160"></div>';
+    h += '<button class="btn block" style="margin-top:10px;" id="tmrFinishBtn" '+(running?'disabled':'')+'>✔ Terminar día y guardar ('+(tmrMs(t)/3600000).toFixed(2)+' h)</button>';
+    if(running) h += '<div class="hint">Primero pulsa Salida para poder guardar.</div>';
+    h += '<button class="btn sm ghost" type="button" id="tmrResetBtn" style="margin-top:6px;">Descartar conteo</button>';
+  }
+  h += '</div>';
+  return h;
+}
+
 function computeHours(start, finish){
   var sp = start.split(':'), fp = finish.split(':');
   var sMin = parseInt(sp[0])*60+parseInt(sp[1]);
@@ -1910,7 +2500,7 @@ function bindModalEvents(name, opts){
       if(!pdOn && !gcOn){ alertBanner('Activa al menos un tipo de control: viáticos o gastos.'); return; }
       var cats = Array.prototype.slice.call(document.getElementById('pjCategories').children).map(function(c){return c.getAttribute('data-cat');});
       var people = Array.prototype.slice.call(document.getElementById('pjPeople').children).map(function(c){return c.getAttribute('data-person');});
-      if(!people.length) people = ['Adiel Palacios'];
+      if(!people.length && !fbMode()) people = ['Adiel Palacios'];
       var data = {
         name: pjName,
         client: document.getElementById('pjClient').value.trim(),
@@ -1971,6 +2561,68 @@ function bindModalEvents(name, opts){
       });
     }
   }
+  else if(name==='team'){
+    var tpid = opts.project;
+    sheet.querySelectorAll('[data-member-role]').forEach(function(sel){
+      sel.addEventListener('change', function(){
+        var uid2 = sel.getAttribute('data-member-role');
+        projRef(tpid).collection('members').doc(uid2).update({ role: sel.value }).then(function(){
+          var m = (state.members[tpid]||[]).filter(function(x){ return x.uid===uid2; })[0]; if(m) m.role = sel.value;
+          alertBanner('Rol actualizado.');
+        }).catch(function(err){ console.error(err); alertBanner('No se pudo cambiar el rol.'); });
+      });
+    });
+    sheet.querySelectorAll('[data-member-remove]').forEach(function(b){
+      b.addEventListener('click', function(){
+        var uid2 = b.getAttribute('data-member-remove');
+        if(!confirm('¿Quitar a esta persona del proyecto? Sus registros se conservan.')) return;
+        projRef(tpid).collection('members').doc(uid2).delete().then(function(){
+          state.members[tpid] = (state.members[tpid]||[]).filter(function(x){ return x.uid!==uid2; });
+          openModal('team', opts);
+        }).catch(function(err){ console.error(err); alertBanner('No se pudo quitar a la persona.'); });
+      });
+    });
+    document.getElementById('tmInvBtn').addEventListener('click', function(){
+      var btn = this; if(btn.disabled) return; btn.disabled = true;
+      var role = document.getElementById('tmInvRole').value;
+      createInvite(tpid, role).then(function(code){
+        state.invites[tpid] = (state.invites[tpid]||[]).concat([{ id:code, role:role, createdAt:new Date().toISOString() }]);
+        openModal('team', opts);
+        copyText(inviteLink(code), 'Enlace de invitación copiado.');
+      }).catch(function(err){ console.error(err); btn.disabled = false; alertBanner('No se pudo crear la invitación.'); });
+    });
+    sheet.querySelectorAll('[data-copy-link]').forEach(function(b){
+      b.addEventListener('click', function(){ copyText(inviteLink(b.getAttribute('data-copy-link')), 'Enlace copiado.'); });
+    });
+    sheet.querySelectorAll('[data-revoke-invite]').forEach(function(b){
+      b.addEventListener('click', function(){
+        var code = b.getAttribute('data-revoke-invite');
+        if(!confirm('¿Revocar este código? Ya no se podrá usar para entrar (quienes ya entraron se quedan).')) return;
+        revokeInvite(tpid, code).then(function(){
+          state.invites[tpid] = (state.invites[tpid]||[]).filter(function(x){ return x.id!==code; });
+          openModal('team', opts);
+        }).catch(function(err){ console.error(err); alertBanner('No se pudo revocar.'); });
+      });
+    });
+  }
+  else if(name==='joinProject'){
+    document.getElementById('jnBtn').addEventListener('click', function(){
+      var btn = this; if(btn.disabled) return;
+      var code = document.getElementById('jnCode').value, nm = document.getElementById('jnName').value.trim();
+      var errEl = document.getElementById('jnError');
+      if(!nm){ errEl.textContent = 'Escribe tu nombre.'; errEl.style.display = 'block'; return; }
+      errEl.style.display = 'none'; btn.disabled = true; btn.textContent = 'Uniéndome…';
+      joinProject(code, nm).then(function(pid){
+        try{ history.replaceState(null, '', location.pathname + location.search); }catch(e){}
+        state.selectedProjectId = pid; closeModal(); alertBanner('Te uniste al proyecto.'); render();
+      }).catch(function(err){
+        console.error(err);
+        btn.disabled = false; btn.textContent = 'Unirme';
+        errEl.textContent = (err && err.message && !err.code) ? err.message : 'No se pudo unir. Revisa el código.';
+        errEl.style.display = 'block';
+      });
+    });
+  }
   else if(name==='newAdvance'){
     var advTypeSeg = document.getElementById('advTypeSeg');
     advTypeSeg.querySelectorAll('button').forEach(function(b){
@@ -1988,6 +2640,7 @@ function bindModalEvents(name, opts){
       btn.disabled = true; btn.textContent = 'Guardando…';
       addRecord('advances', {
         projectId: opts.project,
+        person: (document.getElementById('advPerson')||{}).value || '',
         date: document.getElementById('advDate').value || todayISO(),
         amount: amt,
         method: advTypeSeg.querySelector('button.active').getAttribute('data-advtype'),
@@ -2260,7 +2913,7 @@ document.addEventListener('click', function(e){
   if(weekBtn){ state.weekStart = addDays(state.weekStart, parseInt(weekBtn.getAttribute('data-week'))*7); render(); return; }
 
   var curBtn = t.closest('[data-set-currency]');
-  if(curBtn){ state.expenseCurrency = curBtn.getAttribute('data-set-currency'); render(); return; }
+  if(curBtn){ state.expenseCurrency = curBtn.getAttribute('data-set-currency'); state.fxManual = false; render(); return; }
 
   var personFilterBtn = t.closest('[data-person-filter]');
   if(personFilterBtn){ state.hoursPersonFilter = personFilterBtn.getAttribute('data-person-filter'); render(); return; }
@@ -2320,7 +2973,10 @@ document.addEventListener('click', function(e){
       projectId: p.id,
       date: document.getElementById('expDate').value || todayISO(),
       category: document.getElementById('expCategory').value,
+      person: (document.getElementById('expPerson')||{}).value || undefined,
       currency: cur, amount: amount, fx: fx, mxn: mxn,
+      fxSource: (cur==='USD' && state.fxAuto && Math.abs(state.fxAuto.value-fx)<1e-9) ? 'FIX Banxico' : (cur==='USD' ? 'manual' : 'MXN'),
+      fxDate: (cur==='USD' && state.fxAuto && Math.abs(state.fxAuto.value-fx)<1e-9) ? state.fxAuto.date : '',
       note: document.getElementById('expNote').value.trim(),
       photo: pendingExpensePhoto
     }).then(function(){
@@ -2344,6 +3000,43 @@ document.addEventListener('click', function(e){
       saveExp.textContent = saveExpOrigText;
     });
     return;
+  }
+
+  var tmrEl = t.closest('#tmrStartBtn, #tmrStopBtn, #tmrFinishBtn, #tmrResetBtn');
+  if(tmrEl){
+    var pT = selectedProject(); if(!pT) return;
+    var tpEl = document.getElementById('tmrPerson');
+    var peopleT = peopleFor(pT);
+    var personT = tpEl ? tpEl.value : ((state.timerPerson && peopleT.indexOf(state.timerPerson)!==-1) ? state.timerPerson : (state.hoursPersonFilter==='all'?peopleT[0]:state.hoursPersonFilter));
+    var tm = tmrLoad(pT.id, personT);
+    var last = tm.segs.length ? tm.segs[tm.segs.length-1] : null;
+    if(tmrEl.id==='tmrStartBtn'){
+      if(last && !last[1]) return;
+      if(!tm.segs.length) tm.date = todayISO();
+      tm.segs.push([Date.now(), null]); tmrSave(pT.id, personT, tm); render(); return;
+    }
+    if(tmrEl.id==='tmrStopBtn'){
+      if(last && !last[1]){ last[1] = Date.now(); tmrSave(pT.id, personT, tm); }
+      render(); return;
+    }
+    if(tmrEl.id==='tmrResetBtn'){
+      if(confirm('¿Descartar el conteo actual sin guardar?')){ tm.segs = []; tmrSave(pT.id, personT, tm); render(); }
+      return;
+    }
+    if(tmrEl.id==='tmrFinishBtn'){
+      if(!tm.segs.length || (last && !last[1])){ alertBanner('Pulsa Salida antes de guardar.'); return; }
+      if(tmrEl.disabled) return;
+      var total = Math.round(tmrMs(tm)/36000)/100;
+      var actEl = document.getElementById('tmrActivity');
+      var rec = { projectId: pT.id, person: personT, date: tm.date || todayISO(), activity: actEl ? actEl.value.trim() : '',
+                  start: tmrClock(tm.segs[0][0]), finish: tmrClock(last[1]), hours: total };
+      tmrEl.disabled = true;
+      addRecord('hours', rec).then(function(){
+        tm.segs = []; tmrSave(pT.id, personT, tm);
+        alertBanner('Jornada guardada: '+total.toFixed(2)+' h.'); render();
+      }).catch(function(err){ tmrEl.disabled = false; console.error(err); alertBanner('No se pudo guardar. Intenta de nuevo.'); });
+      return;
+    }
   }
 
   var saveHrs = t.closest('#saveHoursBtn');
@@ -2394,6 +3087,8 @@ document.addEventListener('click', function(e){
 });
 
 document.addEventListener('change', function(e){
+  if(e.target.id==='expDate'){ state.fxManual = false; autoFx(); }
+  if(e.target.id==='tmrPerson'){ state.timerPerson = e.target.value; render(); }
   if(e.target.id==='hrsManualToggle'){ state.hoursManual = e.target.checked; render(); }
   if(e.target.id==='expPhotoInput'){
     var file = e.target.files && e.target.files[0];
@@ -2414,6 +3109,7 @@ document.addEventListener('change', function(e){
 });
 
 document.addEventListener('input', function(e){
+  if(e.target.id==='expFx'){ state.fxManual = true; }
   if(e.target.id==='expAmount' || e.target.id==='expFx'){
     var amt = parseFloat(document.getElementById('expAmount').value)||0;
     var fxEl = document.getElementById('expFx');
@@ -2432,6 +3128,13 @@ document.addEventListener('input', function(e){
 });
 
 /* ================= Boot ================= */
+setInterval(function(){
+  var el = document.getElementById('tmrElapsed');
+  if(!el) return;
+  var t = tmrLoad(el.getAttribute('data-pid'), el.getAttribute('data-person'));
+  el.textContent = tmrFmt(tmrMs(t));
+}, 1000);
+
 function boot(){
   render();
   initStore();
@@ -2443,3 +3146,6 @@ if(window.claude && window.claude.hot){
 }
 })();
 </script>
+
+
+</body></html>
