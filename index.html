@@ -1260,113 +1260,340 @@ function addSectionBar(ws, numCols, title){
   c.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XLS_NAVY} };
   return row;
 }
+/* Reporte de horas: genera DOS archivos al exportar.
+   1) Semanal: solo la semana seleccionada en la app (state.weekStart), en una
+      hoja lista para imprimir/enviar: resumen persona × día y detalle.
+   2) Acumulado: todo el proyecto, resumen por semana y detalle con subtotales.
+   Ambos comparten el mismo estilo (banner naranja, barras azul marino,
+   renglones alternados, totales con fórmula y pie de página para impresión). */
+var HRS_FONT = 'Calibri';
+var HRS_BAND = 'FFF3F6FA';
+var HRS_GRID = 'FFD6DCE4';
+var HRS_LABEL = 'FFE9EEF5';
+var HRS_WEEKBAR = 'FFDCE3EE';
+var HRS_NUM = '0.00;-0.00;"–"';
+var DAY_NAMES = ['Lunes','Martes','Miércoles','Jueves','Viernes','Sábado','Domingo'];
+function hrsXlDate(iso){ var p = iso.split('-'); return new Date(Date.UTC(+p[0], +p[1]-1, +p[2])); }
+function hrsLongDate(d){ return pad2(d.getDate())+' '+MONTHS[d.getMonth()]+' '+d.getFullYear(); }
+function hrsPerson(h, people){ return h.person || people[0] || ''; }
+function hrsSum(arr){ return arr.reduce(function(a,h){ return a+(h.hours||0); }, 0); }
+function hrsSort(arr, people){
+  return arr.slice().sort(function(a,b){
+    return a.date.localeCompare(b.date) || (a.start||'').localeCompare(b.start||'') || hrsPerson(a,people).localeCompare(hrsPerson(b,people));
+  });
+}
+/* Personas con horas, en el orden del proyecto; agrega al final a quien ya no
+   esté en la lista del proyecto pero tenga registros (antes se omitían). */
+function hrsNames(entries, people){
+  var seen = {}, out = [];
+  people.forEach(function(n){
+    if(!seen[n] && entries.some(function(h){ return hrsPerson(h,people)===n; })){ seen[n] = 1; out.push(n); }
+  });
+  entries.forEach(function(h){ var n = hrsPerson(h,people); if(!seen[n]){ seen[n] = 1; out.push(n); } });
+  return out;
+}
+function hrsColL(n){ var s = ''; while(n>0){ var m = (n-1)%26; s = String.fromCharCode(65+m)+s; n = Math.floor((n-1)/26); } return s; }
+function hrsSheet(wb, name, widths){
+  var ws = wb.addWorksheet(name, { views:[{ showGridLines:false }] });
+  ws.columns = widths.map(function(w){ return { width:w }; });
+  ws.pageSetup = { paperSize:1, orientation:'landscape', fitToPage:true, fitToWidth:1, fitToHeight:0, horizontalCentered:true,
+    margins:{ left:0.4, right:0.4, top:0.5, bottom:0.6, header:0.3, footer:0.3 } };
+  ws.headerFooter.oddFooter = '&L&8Viáticos UX&C&8Página &P de &N&R&8Generado el '+hrsLongDate(new Date());
+  return ws;
+}
+function hrsFont(o){ return Object.assign({ name:HRS_FONT, size:10 }, o||{}); }
+function hrsBorder(color){ var s = { style:'thin', color:{ argb: color||HRS_GRID } }; return { top:s, left:s, bottom:s, right:s }; }
+/* Encabezado: título en banner naranja, cliente, y un bloque de datos
+   etiqueta/valor. labelSpan = columnas que ocupa la etiqueta. */
+function hrsHeader(ws, n, title, project, info, labelSpan){
+  var r1 = ws.addRow([title]);
+  ws.mergeCells(r1.number,1,r1.number,n); r1.height = 32;
+  var c1 = r1.getCell(1);
+  c1.font = hrsFont({ bold:true, size:16, color:{argb:'FFFFFFFF'} });
+  c1.alignment = { horizontal:'center', vertical:'middle' };
+  c1.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XLS_ORANGE} };
+
+  var r2 = ws.addRow(['UX AUTOMATION   ·   '+String(project.client||project.name||'').toUpperCase()]);
+  ws.mergeCells(r2.number,1,r2.number,n); r2.height = 22;
+  var c2 = r2.getCell(1);
+  c2.font = hrsFont({ bold:true, size:11, color:{argb:XLS_NAVY} });
+  c2.alignment = { horizontal:'center', vertical:'middle' };
+  c2.border = { bottom:{ style:'medium', color:{argb:XLS_ORANGE} } };
+
+  ws.addRow([]).height = 8;
+  info.forEach(function(it){
+    var r = ws.addRow([it[0]]);
+    if(labelSpan>1) ws.mergeCells(r.number,1,r.number,labelSpan);
+    ws.mergeCells(r.number,labelSpan+1,r.number,n);
+    r.height = 19;
+    var lc = r.getCell(1), vc = r.getCell(labelSpan+1);
+    vc.value = it[1];
+    lc.font = hrsFont({ bold:true, color:{argb:XLS_NAVY} });
+    lc.fill = { type:'pattern', pattern:'solid', fgColor:{argb:HRS_LABEL} };
+    lc.alignment = { vertical:'middle', indent:1 };
+    lc.border = hrsBorder();
+    vc.font = hrsFont(it[2] ? { bold:true, size:12, color:{argb:XLS_NAVY} } : {});
+    vc.alignment = { vertical:'middle', horizontal:'left', indent:1, wrapText:true };
+    vc.border = hrsBorder();
+    if(typeof it[1]==='number') vc.numFmt = '0.00 "h"';
+  });
+  ws.addRow([]).height = 10;
+}
+function hrsSection(ws, n, title){
+  var r = ws.addRow([title]);
+  ws.mergeCells(r.number,1,r.number,n); r.height = 22;
+  var c = r.getCell(1);
+  c.font = hrsFont({ bold:true, size:11, color:{argb:'FFFFFFFF'} });
+  c.alignment = { horizontal:'left', vertical:'middle', indent:1 };
+  c.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XLS_NAVY} };
+  return r;
+}
+function hrsHead(row, n){
+  row.height = 30;
+  for(var i=1;i<=n;i++){
+    var c = row.getCell(i);
+    c.font = hrsFont({ bold:true, color:{argb:XLS_NAVY} });
+    c.fill = { type:'pattern', pattern:'solid', fgColor:{argb:HRS_WEEKBAR} };
+    c.alignment = { horizontal:'center', vertical:'middle', wrapText:true };
+    c.border = { top:{style:'thin',color:{argb:XLS_NAVY}}, bottom:{style:'medium',color:{argb:XLS_NAVY}}, left:{style:'thin',color:{argb:HRS_GRID}}, right:{style:'thin',color:{argb:HRS_GRID}} };
+  }
+}
+function hrsBody(row, n, banded){
+  if(!row.height || row.height<18) row.height = 18;
+  for(var i=1;i<=n;i++){
+    var c = row.getCell(i);
+    c.font = hrsFont();
+    c.border = hrsBorder();
+    if(!c.alignment) c.alignment = { vertical:'middle' };
+    if(banded) c.fill = { type:'pattern', pattern:'solid', fgColor:{argb:HRS_BAND} };
+  }
+}
+function hrsTotalRow(row, n){
+  row.height = 21;
+  for(var i=1;i<=n;i++){
+    var c = row.getCell(i);
+    c.font = hrsFont({ bold:true, size:11, color:{argb:XLS_NAVY} });
+    c.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XLS_TOTAL_TINT} };
+    c.border = { top:{style:'medium',color:{argb:XLS_NAVY}}, bottom:{style:'medium',color:{argb:XLS_NAVY}}, left:{style:'thin',color:{argb:HRS_GRID}}, right:{style:'thin',color:{argb:HRS_GRID}} };
+    if(!c.alignment) c.alignment = { vertical:'middle' };
+  }
+}
+function hrsAlign(cell, h, extra){ cell.alignment = Object.assign({ vertical:'middle', horizontal:h }, extra||{}); }
+function hrsActivityHeight(text, width){
+  var lines = Math.max(1, Math.ceil(String(text||'').length / Math.max(10, width*1.1)));
+  return Math.max(18, 14*lines + 4);
+}
+function hrsPlantReason(project){ return [project.plant, project.reason].filter(Boolean).join('  ·  ') || '—'; }
+
+/* ---------- Archivo 1: una semana ---------- */
+function buildHoursWeekBook(project, entries, people, monday){
+  var sunday = addDays(monday,6), wk = isoWeekNumber(monday);
+  var names = hrsNames(entries, people), N = 9, total = hrsSum(entries);
+  var wb = new ExcelJS.Workbook(); wb.creator = 'Viáticos UX'; wb.created = new Date();
+  var ws = hrsSheet(wb, 'Semana '+wk, [26,11,11,11,11,11,11,11,13]);
+  hrsHeader(ws, N, 'REPORTE SEMANAL DE HORAS', project, [
+    ['Proyecto', project.name],
+    ['Planta / Motivo', hrsPlantReason(project)],
+    ['Semana', 'Semana '+wk+'   ·   del '+hrsLongDate(monday)+' al '+hrsLongDate(sunday)],
+    ['Personal', names.join(', ')],
+    ['Total de horas', total, true]
+  ], 1);
+
+  hrsSection(ws, N, 'RESUMEN POR PERSONA Y DÍA');
+  var head = ['Persona'];
+  for(var i=0;i<7;i++){ var dd = addDays(monday,i); head.push(DAY_NAMES[i]+'\n'+pad2(dd.getDate())+'/'+pad2(dd.getMonth()+1)); }
+  head.push('Total');
+  hrsHead(ws.addRow(head), N);
+  var first = ws.rowCount+1;
+  names.forEach(function(nm, idx){
+    var vals = [nm];
+    for(var d=0; d<7; d++){
+      var iso = toISODate(addDays(monday,d));
+      vals.push(hrsSum(entries.filter(function(h){ return h.date===iso && hrsPerson(h,people)===nm; })));
+    }
+    var r = ws.addRow(vals);
+    var rowTot = vals.slice(1).reduce(function(a,b){ return a+b; }, 0);
+    r.getCell(9).value = { formula:'SUM(B'+r.number+':H'+r.number+')', result: rowTot };
+    hrsBody(r, N, idx%2===1);
+    hrsAlign(r.getCell(1), 'left', { indent:1 });
+    for(var c=2;c<=9;c++){ r.getCell(c).numFmt = HRS_NUM; hrsAlign(r.getCell(c), 'center'); }
+    r.getCell(9).font = hrsFont({ bold:true });
+  });
+  var last = ws.rowCount;
+  var tr = ws.addRow(['TOTAL']);
+  for(var c2=2;c2<=9;c2++){
+    var L = hrsColL(c2), res = 0;
+    for(var rr=first; rr<=last; rr++){ var v = ws.getRow(rr).getCell(c2).value; res += (typeof v==='number' ? v : (v && v.result) || 0); }
+    tr.getCell(c2).value = { formula:'SUM('+L+first+':'+L+last+')', result: res };
+  }
+  hrsTotalRow(tr, N);
+  hrsAlign(tr.getCell(1), 'left', { indent:1 });
+  for(var c3=2;c3<=9;c3++){ tr.getCell(c3).numFmt = HRS_NUM; hrsAlign(tr.getCell(c3), 'center'); }
+
+  ws.addRow([]).height = 12;
+  hrsSection(ws, N, 'DETALLE DE ACTIVIDADES');
+  var hr = ws.addRow(['Persona','Día','Fecha','Entrada','Salida','Horas','Actividad']);
+  ws.mergeCells(hr.number,7,hr.number,9);
+  hrsHead(hr, N);
+  var dFirst = ws.rowCount+1;
+  hrsSort(entries, people).forEach(function(h, idx){
+    var d = parseISODate(h.date);
+    var r = ws.addRow([hrsPerson(h,people), DAY_NAMES[(d.getDay()+6)%7], hrsXlDate(h.date), h.start||'—', h.finish||'Manual', h.hours||0, h.activity||'']);
+    ws.mergeCells(r.number,7,r.number,9);
+    r.height = hrsActivityHeight(h.activity, 35);
+    hrsBody(r, N, idx%2===1);
+    hrsAlign(r.getCell(1), 'left', { indent:1 });
+    for(var c=2;c<=6;c++) hrsAlign(r.getCell(c), 'center');
+    r.getCell(3).numFmt = 'dd/mm/yyyy';
+    r.getCell(6).numFmt = HRS_NUM;
+    hrsAlign(r.getCell(7), 'left', { wrapText:true, indent:1 });
+  });
+  var dLast = ws.rowCount;
+  var dt = ws.addRow(['TOTAL DE LA SEMANA','','','','', { formula:'SUM(F'+dFirst+':F'+dLast+')', result: total }]);
+  ws.mergeCells(dt.number,1,dt.number,5);
+  ws.mergeCells(dt.number,7,dt.number,9);
+  hrsTotalRow(dt, N);
+  hrsAlign(dt.getCell(1), 'right', { indent:1 });
+  dt.getCell(6).numFmt = HRS_NUM; hrsAlign(dt.getCell(6), 'center');
+  return wb;
+}
+
+/* ---------- Archivo 2: acumulado del proyecto ---------- */
+function buildHoursTotalBook(project, entries, people){
+  var weeks = {};
+  entries.forEach(function(h){
+    var mon = mondayOf(parseISODate(h.date)), key = toISODate(mon);
+    if(!weeks[key]) weeks[key] = { monday:mon, sunday:addDays(mon,6), weekNum:isoWeekNumber(mon), entries:[] };
+    weeks[key].entries.push(h);
+  });
+  var keys = Object.keys(weeks).sort();
+  var names = hrsNames(entries, people), total = hrsSum(entries);
+  var sorted = hrsSort(entries, people);
+  var periodo = 'del '+hrsLongDate(parseISODate(sorted[0].date))+' al '+hrsLongDate(parseISODate(sorted[sorted.length-1].date));
+  var wb = new ExcelJS.Workbook(); wb.creator = 'Viáticos UX'; wb.created = new Date();
+
+  /* Hoja 1: resumen por semana */
+  var widths = [10,12,12];
+  names.forEach(function(nm){ widths.push(Math.max(12, Math.min(22, nm.length+4))); });
+  widths.push(13);
+  var N = widths.length;
+  var ws = hrsSheet(wb, 'Resumen semanal', widths);
+  hrsHeader(ws, N, 'REPORTE ACUMULADO DE HORAS', project, [
+    ['Proyecto', project.name],
+    ['Planta / Motivo', hrsPlantReason(project)],
+    ['Periodo', periodo+'   ·   '+keys.length+' semana'+(keys.length===1?'':'s')],
+    ['Personal', names.join(', ')],
+    ['Total de horas', total, true]
+  ], 2);
+  hrsSection(ws, N, 'RESUMEN POR SEMANA');
+  var hr = ws.addRow(['Semana','Del','Al'].concat(names).concat(['Total']));
+  hrsHead(hr, N);
+  var headRow = hr.number, first = headRow+1;
+  keys.forEach(function(k, idx){
+    var wk = weeks[k];
+    var vals = [wk.weekNum, hrsXlDate(toISODate(wk.monday)), hrsXlDate(toISODate(wk.sunday))];
+    var t = 0;
+    names.forEach(function(nm){ var v = hrsSum(wk.entries.filter(function(h){ return hrsPerson(h,people)===nm; })); vals.push(v); t += v; });
+    var r = ws.addRow(vals);
+    r.getCell(N).value = { formula:'SUM('+hrsColL(4)+r.number+':'+hrsColL(N-1)+r.number+')', result:t };
+    hrsBody(r, N, idx%2===1);
+    hrsAlign(r.getCell(1), 'center');
+    r.getCell(2).numFmt = 'dd/mm/yyyy'; r.getCell(3).numFmt = 'dd/mm/yyyy';
+    hrsAlign(r.getCell(2), 'center'); hrsAlign(r.getCell(3), 'center');
+    for(var c=4;c<=N;c++){ r.getCell(c).numFmt = HRS_NUM; hrsAlign(r.getCell(c), 'center'); }
+    r.getCell(N).font = hrsFont({ bold:true });
+  });
+  var last = ws.rowCount;
+  var gt = ws.addRow(['TOTAL GENERAL']);
+  ws.mergeCells(gt.number,1,gt.number,3);
+  for(var c2=4;c2<=N;c2++){
+    var L = hrsColL(c2), res = 0;
+    for(var rr=first; rr<=last; rr++){ var v = ws.getRow(rr).getCell(c2).value; res += (typeof v==='number' ? v : (v && v.result) || 0); }
+    gt.getCell(c2).value = { formula:'SUM('+L+first+':'+L+last+')', result:res };
+  }
+  hrsTotalRow(gt, N);
+  hrsAlign(gt.getCell(1), 'right', { indent:1 });
+  for(var c3=4;c3<=N;c3++){ gt.getCell(c3).numFmt = HRS_NUM; hrsAlign(gt.getCell(c3), 'center'); }
+  ws.views = [{ state:'frozen', ySplit:headRow, showGridLines:false }];
+  ws.pageSetup.printTitlesRow = headRow+':'+headRow;
+
+  /* Hoja 2: detalle por semana con subtotales */
+  var D = 8;
+  var det = hrsSheet(wb, 'Detalle', [9,12,12,24,10,10,10,44]);
+  hrsHeader(det, D, 'DETALLE ACUMULADO DE HORAS', project, [
+    ['Proyecto', project.name],
+    ['Periodo', periodo],
+    ['Total de horas', total, true]
+  ], 2);
+  var dh = det.addRow(['Semana','Día','Fecha','Persona','Entrada','Salida','Horas','Actividad']);
+  hrsHead(dh, D);
+  var dHead = dh.number, subCells = [];
+  keys.forEach(function(k){
+    var wk = weeks[k];
+    var bar = det.addRow(['Semana '+wk.weekNum+'   ·   '+hrsLongDate(wk.monday)+' – '+hrsLongDate(wk.sunday)]);
+    det.mergeCells(bar.number,1,bar.number,D); bar.height = 20;
+    var bc = bar.getCell(1);
+    bc.font = hrsFont({ bold:true, color:{argb:XLS_NAVY} });
+    bc.fill = { type:'pattern', pattern:'solid', fgColor:{argb:HRS_LABEL} };
+    bc.alignment = { vertical:'middle', indent:1 };
+    bc.border = { top:{style:'thin',color:{argb:XLS_NAVY}}, bottom:{style:'thin',color:{argb:HRS_GRID}} };
+    var f = det.rowCount+1;
+    hrsSort(wk.entries, people).forEach(function(h, idx){
+      var d = parseISODate(h.date);
+      var r = det.addRow([wk.weekNum, DAY_NAMES[(d.getDay()+6)%7], hrsXlDate(h.date), hrsPerson(h,people), h.start||'—', h.finish||'Manual', h.hours||0, h.activity||'']);
+      r.height = hrsActivityHeight(h.activity, 44);
+      hrsBody(r, D, idx%2===1);
+      for(var c=1;c<=7;c++) hrsAlign(r.getCell(c), c===4 ? 'left' : 'center', c===4 ? { indent:1 } : null);
+      r.getCell(3).numFmt = 'dd/mm/yyyy';
+      r.getCell(7).numFmt = HRS_NUM;
+      hrsAlign(r.getCell(8), 'left', { wrapText:true, indent:1 });
+    });
+    var l = det.rowCount, st = hrsSum(wk.entries);
+    var sr = det.addRow(['Total semana '+wk.weekNum,'','','','','', { formula:'SUM(G'+f+':G'+l+')', result:st }, '']);
+    for(var c4=1;c4<=D;c4++){
+      var sc = sr.getCell(c4);
+      sc.font = hrsFont({ bold:true, color:{argb:XLS_NAVY} });
+      sc.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XLS_TOTAL_TINT} };
+      sc.border = { top:{style:'thin',color:{argb:XLS_NAVY}} };
+    }
+    det.mergeCells(sr.number,1,sr.number,6);
+    hrsAlign(sr.getCell(1), 'right', { indent:1 });
+    sr.getCell(7).numFmt = HRS_NUM; hrsAlign(sr.getCell(7), 'center');
+    sr.height = 19;
+    subCells.push('G'+sr.number);
+    det.addRow([]).height = 6;
+  });
+  var dt = det.addRow(['TOTAL GENERAL','','','','','', { formula: subCells.join('+'), result: total }, '']);
+  det.mergeCells(dt.number,1,dt.number,6);
+  hrsTotalRow(dt, D);
+  hrsAlign(dt.getCell(1), 'right', { indent:1 });
+  dt.getCell(7).numFmt = HRS_NUM; hrsAlign(dt.getCell(7), 'center');
+  det.views = [{ state:'frozen', ySplit:dHead, showGridLines:false }];
+  det.pageSetup.printTitlesRow = dHead+':'+dHead;
+  return wb;
+}
+
 function exportHoursXLSX(project){
   if(typeof ExcelJS==='undefined'){ alertBanner('No se pudo cargar el generador de Excel (revisa tu conexión).'); return; }
   var entries = state.hours.filter(function(h){ return h.projectId===project.id; });
   if(!entries.length){ alertBanner('Este proyecto no tiene horas registradas.'); return; }
   var people = peopleFor(project);
-
-  /* Agrupa por semana ISO (lunes a domingo), igual que el resto de la app. */
-  var weeks = {};
-  entries.forEach(function(h){
-    var d = parseISODate(h.date);
-    var mon = mondayOf(d);
-    var key = toISODate(mon);
-    if(!weeks[key]) weeks[key] = { monday: mon, sunday: addDays(mon,6), weekNum: isoWeekNumber(mon), entries: [] };
-    weeks[key].entries.push(h);
-  });
-  var weekKeys = Object.keys(weeks).sort();
-  var sortEntries = function(arr){
-    return arr.slice().sort(function(a,b){
-      return a.date===b.date ? (a.start||'').localeCompare(b.start||'') : a.date.localeCompare(b.date);
+  var monday = mondayOf(state.weekStart), sunday = addDays(monday,6), wk = isoWeekNumber(monday);
+  var from = toISODate(monday), to = toISODate(sunday);
+  var weekEntries = entries.filter(function(h){ return h.date>=from && h.date<=to; });
+  var safe = project.name.replace(/[^a-z0-9]+/gi,'_');
+  var jobs = [];
+  if(weekEntries.length) jobs.push({ wb: buildHoursWeekBook(project, weekEntries, people, monday), name: 'Horas_'+safe+'_Semana'+wk+'_'+from+'_al_'+to+'.xlsx' });
+  jobs.push({ wb: buildHoursTotalBook(project, entries, people), name: 'Horas_'+safe+'_Acumulado_'+todayISO()+'.xlsx' });
+  Promise.all(jobs.map(function(j){ return j.wb.xlsx.writeBuffer(); })).then(function(buffers){
+    buffers.forEach(function(buf, i){
+      setTimeout(function(){
+        downloadBlobFile(new Blob([buf], { type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), jobs[i].name);
+      }, i*900);
     });
-  };
-
-  var wb = new ExcelJS.Workbook();
-  wb.creator = 'Viáticos UX';
-  wb.created = new Date();
-
-  /* ---- Hoja 1: Resumen semanal, con el total por persona y el total general ---- */
-  var sum = wb.addWorksheet('Resumen semanal');
-  var sumCols = [ { key:'week', width:9 }, { key:'from', width:13 }, { key:'to', width:13 } ];
-  people.forEach(function(nm){ sumCols.push({ key:'p_'+nm, width:16 }); });
-  sumCols.push({ key:'total', width:14 });
-  sum.columns = sumCols;
-  addSheetHeader(sum, sumCols.length, project, 'RESUMEN SEMANAL DE HORAS');
-  var sumHeaderData = { week:'Semana', from:'Del', to:'Al', total:'Total semana' };
-  people.forEach(function(nm){ sumHeaderData['p_'+nm] = nm; });
-  var sumHeaderRow = sum.addRow(sumHeaderData);
-  styleColumnHeaderRow(sumHeaderRow, sumCols.length);
-
-  var grandTotal = 0, grandByPerson = {};
-  people.forEach(function(nm){ grandByPerson[nm] = 0; });
-  weekKeys.forEach(function(key){
-    var wk = weeks[key];
-    var rowData = { week: wk.weekNum, from: toISODate(wk.monday), to: toISODate(wk.sunday) };
-    var weekTotal = 0;
-    people.forEach(function(nm){
-      var t = wk.entries.filter(function(h){ return (h.person||people[0])===nm; }).reduce(function(a,h){return a+(h.hours||0);},0);
-      rowData['p_'+nm] = t;
-      weekTotal += t;
-      grandByPerson[nm] += t;
-    });
-    rowData.total = weekTotal;
-    grandTotal += weekTotal;
-    var r = sum.addRow(rowData);
-    people.forEach(function(nm){ r.getCell('p_'+nm).numFmt = '0.0'; });
-    r.getCell('total').numFmt = '0.0';
-    r.getCell('total').font = { bold:true };
-  });
-  var grandData = { from:'', to:'TOTAL GENERAL', total: grandTotal };
-  people.forEach(function(nm){ grandData['p_'+nm] = grandByPerson[nm]; });
-  var grandRow = sum.addRow(grandData);
-  grandRow.font = { bold:true };
-  grandRow.eachCell({ includeEmpty:true }, function(cell){ cell.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XLS_TOTAL_TINT} }; });
-  people.forEach(function(nm){ grandRow.getCell('p_'+nm).numFmt = '0.0'; });
-  grandRow.getCell('total').numFmt = '0.0';
-  sum.views = [{ state:'frozen', ySplit:6 }];
-
-  /* ---- Hoja 2: Detalle día por día, con subtotal al cierre de cada semana ---- */
-  var det = wb.addWorksheet('Detalle');
-  var detCols = [
-    { key:'week', width:9 }, { key:'day', width:10 }, { key:'date', width:13 },
-    { key:'person', width:20 }, { key:'start', width:10 }, { key:'finish', width:12 },
-    { key:'hours', width:9 }, { key:'activity', width:32 }
-  ];
-  det.columns = detCols;
-  addSheetHeader(det, detCols.length, project, 'DETALLE DE HORAS POR SEMANA');
-  var detHeaderRow = det.addRow({ week:'Semana', day:'Día', date:'Fecha', person:'Persona', start:'Entrada', finish:'Salida', hours:'Horas', activity:'Actividad' });
-  styleColumnHeaderRow(detHeaderRow, detCols.length);
-
-  weekKeys.forEach(function(key){
-    var wk = weeks[key];
-    var rows = sortEntries(wk.entries);
-    rows.forEach(function(h){
-      var d = parseISODate(h.date);
-      var dayName = WEEKDAYS[(d.getDay()+6)%7];
-      var row = det.addRow({
-        week: wk.weekNum, day: dayName, date: h.date,
-        person: h.person || people[0],
-        start: h.start || '', finish: h.finish || 'Manual',
-        hours: h.hours || 0, activity: h.activity || ''
-      });
-      row.getCell('hours').numFmt = '0.0';
-    });
-    var total = rows.reduce(function(a,h){ return a+(h.hours||0); }, 0);
-    var totalRow = det.addRow({ finish:'Total semana '+wk.weekNum+':', hours: total });
-    totalRow.font = { bold:true };
-    totalRow.getCell('hours').numFmt = '0.0';
-    totalRow.eachCell({ includeEmpty:true }, function(cell){
-      cell.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XLS_TOTAL_TINT} };
-      cell.border = { top:{style:'thin', color:{argb:'FFAAAAAA'}} };
-    });
-  });
-  det.views = [{ state:'frozen', ySplit:6 }];
-
-  wb.xlsx.writeBuffer().then(function(buffer){
-    var blob = new Blob([buffer], { type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-    var filename = 'Horas_'+project.name.replace(/[^a-z0-9]+/gi,'_')+'_'+todayISO()+'.xlsx';
-    downloadBlobFile(blob, filename);
+    alertBanner(weekEntries.length
+      ? 'Se generaron 2 archivos: semana '+wk+' y acumulado del proyecto.'
+      : 'La semana '+wk+' no tiene horas registradas; se generó solo el acumulado.');
   }).catch(function(err){ console.error(err); alertBanner('No se pudo generar el archivo de Excel.'); });
 }
 
@@ -2060,7 +2287,7 @@ function renderResumen(){
     if(fbMode() && admin) html += '<button class="btn sm" data-open-modal="team" data-project="'+p.id+'">Equipo e invitaciones</button>';
     html += '<button class="btn sm" data-export-csv="'+p.id+'">Exportar CSV</button>';
     html += '<button class="btn sm" data-export-gastos-xlsx="'+p.id+'">Exportar gastos (Excel)</button>';
-    html += '<button class="btn sm" data-export-hours="'+p.id+'">Exportar horas (Excel)</button>';
+    html += '<button class="btn sm" data-export-hours="'+p.id+'">Exportar horas (Excel): semana '+isoWeekNumber(state.weekStart)+' + acumulado</button>';
     html += '</div>';
     if(fbMode() && isStaffRole(p)) html += personTable(p, expenses, advances);
     html += '</div>';
