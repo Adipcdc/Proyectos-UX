@@ -513,7 +513,7 @@ table.pivot td.zero{ color:var(--text-faint); }
 /* Versión visible en la tarjeta "Cuenta" y en la ventana del reporte de horas,
    para saber si el teléfono ya cargó la última publicación (GitHub Pages deja
    que el navegador guarde la página hasta 10 minutos). */
-var APP_VERSION = 'v28c · 16-nov-2026';
+var APP_VERSION = 'v28d · 16-nov-2026';
 var BANXICO_TOKEN = '5840a49bd275863bff4b9a18e9254751d46ea271c07de125104b822fda3da504';
 
 var FIREBASE_CONFIG = {
@@ -1653,6 +1653,31 @@ function hrsShareFiles(files){
   }catch(e){ return null; }
 }
 function hrsFileLabel(f, week){ return f.kind==='week' ? 'semana '+week : 'acumulado del proyecto'; }
+/* Dispositivo y navegador en pocas palabras, para diagnosticar errores al compartir. */
+function hrsDevice(){
+  var ua = navigator.userAgent || '';
+  var dev = /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints>1) ? 'iPad' :
+            /Android/.test(ua) ? 'Android' : /Windows/.test(ua) ? 'Windows' : /Macintosh/.test(ua) ? 'Mac' : 'otro';
+  var br = /EdgA?\//.test(ua) ? 'Edge' : /CriOS|Chrome\//.test(ua) ? 'Chrome' : /FxiOS|Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : 'otro';
+  var os = (/OS (\d+)[_.](\d+)/.exec(ua) || /Android (\d+)/.exec(ua) || /Windows NT (\d+\.\d+)/.exec(ua) || []);
+  return dev+' · '+br+(os[1] ? ' · '+os[1]+(os[2]?'.'+os[2]:'') : '');
+}
+/* Comparte una lista de archivos y reporta el resultado en el mensaje de la ventana. */
+function hrsDoShare(list, say, onNotAllowed){
+  say('Abriendo el menú para compartir…');
+  var fail = function(err){
+    console.error(err);
+    var nm = (err && err.name) || 'error';
+    if(nm==='NotAllowedError' && onNotAllowed){ onNotAllowed(nm); return; }
+    say('No se pudo compartir ('+nm+' · '+hrsDevice()+'). Descarga cada archivo con su botón.');
+  };
+  try{
+    /* Solo archivos, sin título ni texto: en iPhone, mezclar texto con
+       archivos puede hacer que se ignoren los archivos o falle. */
+    navigator.share({ files: list }).then(function(){ say('Listo: archivo(s) compartido(s).'); })
+      .catch(function(err){ if(err && err.name==='AbortError'){ say(''); return; } fail(err); });
+  }catch(err){ fail(err); }
+}
 function modalHoursFiles(opts){
   var lang = opts.lang==='en' ? 'en' : 'es';
   var files = (opts.files && opts.files[lang]) || [];
@@ -1668,7 +1693,16 @@ function modalHoursFiles(opts){
     html += '<div class="hint" style="margin:4px 0 0;word-break:break-all;">'+esc(f.name)+'</div>';
   });
   if(files.length>1){
-    if(hrsShareFiles(files)) html += '<button type="button" class="btn block ghost" id="hrsShareBtn" style="margin-top:14px;">Compartir ambos (correo, Archivos…)</button>';
+    if(hrsShareFiles(files)){
+      html += '<button type="button" class="btn block ghost" id="hrsShareBtn" style="margin-top:14px;">Compartir ambos (correo, Archivos…)</button>';
+      /* Alternativa que se muestra si el navegador rechaza compartir los dos
+         archivos juntos: un botón por archivo (cada toque es una acción nueva). */
+      html += '<div id="hrsShareEach" style="display:none;">';
+      files.forEach(function(f, i){
+        html += '<button type="button" class="btn block ghost" data-hrs-share="'+i+'" style="margin-top:8px;">Compartir '+esc(hrsFileLabel(f, opts.week))+'</button>';
+      });
+      html += '</div>';
+    }
     else html += '<div class="hint" style="margin:12px 0 0;">Este navegador no permite compartir varios archivos a la vez: descarga cada uno con su botón.</div>';
   }
   /* Mensajes de estado dentro de la ventana (el aviso general de la app
@@ -2989,23 +3023,24 @@ function bindModalEvents(name, opts){
         var say = function(t){ if(msg) msg.textContent = t; };
         var list = hrsShareFiles(hFiles);
         if(!list){ say('Este dispositivo no permite compartir estos archivos; descárgalos con los botones de arriba.'); return; }
-        say('Abriendo el menú para compartir…');
-        /* Solo archivos, sin título ni texto: en iPhone, mezclar texto con
-           archivos puede hacer que se ignoren los archivos o falle. */
-        try{
-          navigator.share({ files: list }).then(function(){
-            say('Listo: archivos compartidos.');
-          }).catch(function(err){
-            if(err && err.name==='AbortError'){ say(''); return; }
-            console.error(err);
-            say('No se pudo compartir ('+((err && err.name) || 'error')+'). Descarga cada archivo con su botón.');
-          });
-        }catch(err){
-          console.error(err);
-          say('No se pudo compartir ('+((err && err.name) || 'error')+'). Descarga cada archivo con su botón.');
-        }
+        hrsDoShare(list, say, function(nm){
+          var each = document.getElementById('hrsShareEach');
+          if(each) each.style.display = '';
+          shareBtn.style.display = 'none';
+          say('Este navegador no permitió compartir los dos juntos ('+nm+' · '+hrsDevice()+'). Prueba compartir cada uno con los botones de abajo, o descárgalos.');
+        });
       });
     }
+    sheet.querySelectorAll('[data-hrs-share]').forEach(function(b){
+      b.addEventListener('click', function(){
+        var msg = document.getElementById('hrsMsg');
+        var say = function(t){ if(msg) msg.textContent = t; };
+        var f = hFiles[parseInt(b.getAttribute('data-hrs-share'),10)];
+        var one = f ? hrsShareFiles([f]) : null;
+        if(!one){ say('Este dispositivo no permite compartir este archivo; descárgalo con su botón.'); return; }
+        hrsDoShare(one, say, null);
+      });
+    });
   }
   else if(name==='viewAdvances'){
     sheet.querySelectorAll('[data-delete-advance]').forEach(function(b){
