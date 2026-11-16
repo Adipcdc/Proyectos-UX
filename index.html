@@ -1583,18 +1583,38 @@ function exportHoursXLSX(project){
   var weekEntries = entries.filter(function(h){ return h.date>=from && h.date<=to; });
   var safe = project.name.replace(/[^a-z0-9]+/gi,'_');
   var jobs = [];
-  if(weekEntries.length) jobs.push({ wb: buildHoursWeekBook(project, weekEntries, people, monday), name: 'Horas_'+safe+'_Semana'+wk+'_'+from+'_al_'+to+'.xlsx' });
-  jobs.push({ wb: buildHoursTotalBook(project, entries, people), name: 'Horas_'+safe+'_Acumulado_'+todayISO()+'.xlsx' });
+  if(weekEntries.length) jobs.push({ label:'semana '+wk, wb: buildHoursWeekBook(project, weekEntries, people, monday), name: 'Horas_'+safe+'_Semana'+wk+'_'+from+'_al_'+to+'.xlsx' });
+  jobs.push({ label:'acumulado del proyecto', wb: buildHoursTotalBook(project, entries, people), name: 'Horas_'+safe+'_Acumulado_'+todayISO()+'.xlsx' });
+  /* Los navegadores (Safari en iPhone, Chrome) solo permiten UNA descarga por
+     toque: la segunda descarga automática se bloquea. Por eso los archivos se
+     entregan en una ventana con un botón por archivo (cada toque = una
+     descarga) y, si el dispositivo lo permite, "Compartir ambos". */
   Promise.all(jobs.map(function(j){ return j.wb.xlsx.writeBuffer(); })).then(function(buffers){
-    buffers.forEach(function(buf, i){
-      setTimeout(function(){
-        downloadBlobFile(new Blob([buf], { type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), jobs[i].name);
-      }, i*900);
+    var files = buffers.map(function(buf, i){
+      return { label: jobs[i].label, name: jobs[i].name,
+        blob: new Blob([buf], { type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }) };
     });
-    alertBanner(weekEntries.length
-      ? 'Se generaron 2 archivos: semana '+wk+' y acumulado del proyecto.'
-      : 'La semana '+wk+' no tiene horas registradas; se generó solo el acumulado.');
+    openModal('hoursFiles', { files: files, week: wk, weekEmpty: !weekEntries.length, project: project.name });
   }).catch(function(err){ console.error(err); alertBanner('No se pudo generar el archivo de Excel.'); });
+}
+function hrsShareFiles(files){
+  try{
+    if(typeof File==='undefined' || !navigator.canShare) return null;
+    var list = files.map(function(f){ return new File([f.blob], f.name, { type: f.blob.type }); });
+    return navigator.canShare({ files: list }) ? list : null;
+  }catch(e){ return null; }
+}
+function modalHoursFiles(opts){
+  var files = opts.files || [];
+  var html = '<div class="modal-head"><h2>Reporte de horas listo</h2><button class="modal-close" data-close-modal="1">✕</button></div>';
+  html += '<div class="hint" style="margin:0 0 12px;">'+esc(opts.project||'')+' · Toca cada archivo para descargarlo.</div>';
+  if(opts.weekEmpty) html += '<div class="hint" style="margin:0 0 12px;">La semana '+opts.week+' no tiene horas registradas: solo se generó el acumulado. Para otra semana, cámbiala en Resumen y vuelve a exportar.</div>';
+  files.forEach(function(f, i){
+    html += '<button type="button" class="btn block" data-hrs-file="'+i+'" style="margin-top:8px;">Descargar '+esc(f.label)+'</button>';
+    html += '<div class="hint" style="margin:4px 0 0;word-break:break-all;">'+esc(f.name)+'</div>';
+  });
+  if(files.length>1 && hrsShareFiles(files)) html += '<button type="button" class="btn block ghost" id="hrsShareBtn" style="margin-top:14px;">Compartir ambos (correo, Archivos…)</button>';
+  return html;
 }
 
 /* ================= Excel export: gastos (con fotos de tickets) ================= */
@@ -2386,6 +2406,7 @@ function openModal(name, opts){
   else if(name==='editHours') html = modalHoursForm(byId(state.hours, opts.hours));
   else if(name==='copyHours') html = modalCopyHoursForm(byId(state.projects, opts.project));
   else if(name==='removePerson') html = modalRemovePersonForm(byId(state.projects, opts.project));
+  else if(name==='hoursFiles') html = modalHoursFiles(opts);
   root.innerHTML = '<div class="modal-overlay" id="modalOverlay"><div class="modal-sheet" id="modalSheet"></div></div>';
   document.getElementById('modalSheet').innerHTML = html;
   document.getElementById('modalOverlay').addEventListener('click', function(e){
@@ -2880,6 +2901,26 @@ function bindModalEvents(name, opts){
         btn.disabled = false; btn.textContent = origText;
       });
     });
+  }
+  else if(name==='hoursFiles'){
+    sheet.querySelectorAll('[data-hrs-file]').forEach(function(b){
+      b.addEventListener('click', function(){
+        var f = opts.files[parseInt(b.getAttribute('data-hrs-file'),10)];
+        if(!f) return;
+        downloadBlobFile(f.blob, f.name);
+        b.textContent = '✓ Descargado: '+f.label+' (toca para repetir)';
+      });
+    });
+    var shareBtn = document.getElementById('hrsShareBtn');
+    if(shareBtn){
+      shareBtn.addEventListener('click', function(){
+        var list = hrsShareFiles(opts.files);
+        if(!list){ alertBanner('Este dispositivo no permite compartir archivos; descárgalos uno por uno.'); return; }
+        navigator.share({ files: list, title: 'Reporte de horas · '+(opts.project||'') }).catch(function(err){
+          if(err && err.name!=='AbortError'){ console.error(err); alertBanner('No se pudo compartir; descarga los archivos uno por uno.'); }
+        });
+      });
+    }
   }
   else if(name==='viewAdvances'){
     sheet.querySelectorAll('[data-delete-advance]').forEach(function(b){
