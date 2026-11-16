@@ -1260,21 +1260,57 @@ function addSectionBar(ws, numCols, title){
   c.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XLS_NAVY} };
   return row;
 }
-/* Reporte de horas: genera DOS archivos al exportar.
+/* Reporte de horas: genera DOS archivos al exportar, en español o inglés.
    1) Semanal: solo la semana seleccionada en la app (state.weekStart), en una
       hoja lista para imprimir/enviar: resumen persona × día y detalle.
    2) Acumulado: todo el proyecto, resumen por semana y detalle con subtotales.
    Ambos comparten el mismo estilo (banner naranja, barras azul marino,
-   renglones alternados, totales con fórmula y pie de página para impresión). */
+   renglones alternados, totales con fórmula y pie de página para impresión).
+   El idioma se elige en la ventana de descarga y se recuerda por proyecto.
+   Las actividades, planta y motivo se exportan tal como se capturaron. */
 var HRS_FONT = 'Calibri';
 var HRS_BAND = 'FFF3F6FA';
 var HRS_GRID = 'FFD6DCE4';
 var HRS_LABEL = 'FFE9EEF5';
 var HRS_WEEKBAR = 'FFDCE3EE';
 var HRS_NUM = '0.00;-0.00;"–"';
-var DAY_NAMES = ['Lunes','Martes','Miércoles','Jueves','Viernes','Sábado','Domingo'];
+var HRS_TXT = {
+  es: {
+    titleWeek:'REPORTE SEMANAL DE HORAS', titleTotal:'REPORTE ACUMULADO DE HORAS', titleDetail:'DETALLE ACUMULADO DE HORAS',
+    project:'Proyecto', plantReason:'Planta / Motivo', week:'Semana', period:'Periodo', staff:'Personal', totalHours:'Total de horas',
+    secPersonDay:'RESUMEN POR PERSONA Y DÍA', secDetail:'DETALLE DE ACTIVIDADES', secByWeek:'RESUMEN POR SEMANA',
+    person:'Persona', day:'Día', date:'Fecha', start:'Entrada', finish:'Salida', hours:'Horas', activity:'Actividad',
+    total:'Total', TOTAL:'TOTAL', weekTotal:'TOTAL DE LA SEMANA', grandTotal:'TOTAL GENERAL', from:'Del', to:'Al',
+    manual:'Manual', days:['Lunes','Martes','Miércoles','Jueves','Viernes','Sábado','Domingo'],
+    months:['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'], dateFmt:'dd/mm/yyyy',
+    longDate:function(d){ return pad2(d.getDate())+' '+this.months[d.getMonth()]+' '+d.getFullYear(); },
+    dayMonth:function(d){ return pad2(d.getDate())+'/'+pad2(d.getMonth()+1); },
+    weekN:function(n){ return 'Semana '+n; }, weekSub:function(n){ return 'Total semana '+n; },
+    weeks:function(n){ return n+' semana'+(n===1?'':'s'); }, range:function(a,b){ return 'del '+a+' al '+b; },
+    footer:'&L&8Viáticos UX&C&8Página &P de &N&R&8Generado el ',
+    sheetSummary:'Resumen semanal', sheetDetail:'Detalle',
+    fileWeek:function(p,n,a,b){ return 'Horas_'+p+'_Semana'+n+'_'+a+'_al_'+b+'.xlsx'; },
+    fileTotal:function(p,d){ return 'Horas_'+p+'_Acumulado_'+d+'.xlsx'; }
+  },
+  en: {
+    titleWeek:'WEEKLY HOURS REPORT', titleTotal:'CUMULATIVE HOURS REPORT', titleDetail:'CUMULATIVE HOURS DETAIL',
+    project:'Project', plantReason:'Plant / Reason', week:'Week', period:'Period', staff:'Team', totalHours:'Total hours',
+    secPersonDay:'SUMMARY BY PERSON AND DAY', secDetail:'ACTIVITY DETAIL', secByWeek:'SUMMARY BY WEEK',
+    person:'Person', day:'Day', date:'Date', start:'Start', finish:'End', hours:'Hours', activity:'Activity',
+    total:'Total', TOTAL:'TOTAL', weekTotal:'WEEK TOTAL', grandTotal:'GRAND TOTAL', from:'From', to:'To',
+    manual:'Manual', days:['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
+    months:['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'], dateFmt:'mm/dd/yyyy',
+    longDate:function(d){ return this.months[d.getMonth()]+' '+pad2(d.getDate())+', '+d.getFullYear(); },
+    dayMonth:function(d){ return pad2(d.getMonth()+1)+'/'+pad2(d.getDate()); },
+    weekN:function(n){ return 'Week '+n; }, weekSub:function(n){ return 'Week '+n+' total'; },
+    weeks:function(n){ return n+' week'+(n===1?'':'s'); }, range:function(a,b){ return 'from '+a+' to '+b; },
+    footer:'&L&8Viáticos UX&C&8Page &P of &N&R&8Generated on ',
+    sheetSummary:'Weekly summary', sheetDetail:'Detail',
+    fileWeek:function(p,n,a,b){ return 'Hours_'+p+'_Week'+n+'_'+a+'_to_'+b+'.xlsx'; },
+    fileTotal:function(p,d){ return 'Hours_'+p+'_Cumulative_'+d+'.xlsx'; }
+  }
+};
 function hrsXlDate(iso){ var p = iso.split('-'); return new Date(Date.UTC(+p[0], +p[1]-1, +p[2])); }
-function hrsLongDate(d){ return pad2(d.getDate())+' '+MONTHS[d.getMonth()]+' '+d.getFullYear(); }
 function hrsPerson(h, people){ return h.person || people[0] || ''; }
 function hrsSum(arr){ return arr.reduce(function(a,h){ return a+(h.hours||0); }, 0); }
 function hrsSort(arr, people){
@@ -1293,12 +1329,12 @@ function hrsNames(entries, people){
   return out;
 }
 function hrsColL(n){ var s = ''; while(n>0){ var m = (n-1)%26; s = String.fromCharCode(65+m)+s; n = Math.floor((n-1)/26); } return s; }
-function hrsSheet(wb, name, widths){
+function hrsSheet(wb, name, widths, T){
   var ws = wb.addWorksheet(name, { views:[{ showGridLines:false }] });
   ws.columns = widths.map(function(w){ return { width:w }; });
   ws.pageSetup = { paperSize:1, orientation:'landscape', fitToPage:true, fitToWidth:1, fitToHeight:0, horizontalCentered:true,
     margins:{ left:0.4, right:0.4, top:0.5, bottom:0.6, header:0.3, footer:0.3 } };
-  ws.headerFooter.oddFooter = '&L&8Viáticos UX&C&8Página &P de &N&R&8Generado el '+hrsLongDate(new Date());
+  ws.headerFooter.oddFooter = T.footer+T.longDate(new Date());
   return ws;
 }
 function hrsFont(o){ return Object.assign({ name:HRS_FONT, size:10 }, o||{}); }
@@ -1386,23 +1422,23 @@ function hrsActivityHeight(text, width){
 function hrsPlantReason(project){ return [project.plant, project.reason].filter(Boolean).join('  ·  ') || '—'; }
 
 /* ---------- Archivo 1: una semana ---------- */
-function buildHoursWeekBook(project, entries, people, monday){
+function buildHoursWeekBook(project, entries, people, monday, T){
   var sunday = addDays(monday,6), wk = isoWeekNumber(monday);
   var names = hrsNames(entries, people), N = 9, total = hrsSum(entries);
   var wb = new ExcelJS.Workbook(); wb.creator = 'Viáticos UX'; wb.created = new Date();
-  var ws = hrsSheet(wb, 'Semana '+wk, [26,11,11,11,11,11,11,11,13]);
-  hrsHeader(ws, N, 'REPORTE SEMANAL DE HORAS', project, [
-    ['Proyecto', project.name],
-    ['Planta / Motivo', hrsPlantReason(project)],
-    ['Semana', 'Semana '+wk+'   ·   del '+hrsLongDate(monday)+' al '+hrsLongDate(sunday)],
-    ['Personal', names.join(', ')],
-    ['Total de horas', total, true]
+  var ws = hrsSheet(wb, T.weekN(wk), [26,11,11,11,11,11,11,11,13], T);
+  hrsHeader(ws, N, T.titleWeek, project, [
+    [T.project, project.name],
+    [T.plantReason, hrsPlantReason(project)],
+    [T.week, T.weekN(wk)+'   ·   '+T.range(T.longDate(monday), T.longDate(sunday))],
+    [T.staff, names.join(', ')],
+    [T.totalHours, total, true]
   ], 1);
 
-  hrsSection(ws, N, 'RESUMEN POR PERSONA Y DÍA');
-  var head = ['Persona'];
-  for(var i=0;i<7;i++){ var dd = addDays(monday,i); head.push(DAY_NAMES[i]+'\n'+pad2(dd.getDate())+'/'+pad2(dd.getMonth()+1)); }
-  head.push('Total');
+  hrsSection(ws, N, T.secPersonDay);
+  var head = [T.person];
+  for(var i=0;i<7;i++){ head.push(T.days[i]+'\n'+T.dayMonth(addDays(monday,i))); }
+  head.push(T.total);
   hrsHead(ws.addRow(head), N);
   var first = ws.rowCount+1;
   names.forEach(function(nm, idx){
@@ -1420,7 +1456,7 @@ function buildHoursWeekBook(project, entries, people, monday){
     r.getCell(9).font = hrsFont({ bold:true });
   });
   var last = ws.rowCount;
-  var tr = ws.addRow(['TOTAL']);
+  var tr = ws.addRow([T.TOTAL]);
   for(var c2=2;c2<=9;c2++){
     var L = hrsColL(c2), res = 0;
     for(var rr=first; rr<=last; rr++){ var v = ws.getRow(rr).getCell(c2).value; res += (typeof v==='number' ? v : (v && v.result) || 0); }
@@ -1431,25 +1467,25 @@ function buildHoursWeekBook(project, entries, people, monday){
   for(var c3=2;c3<=9;c3++){ tr.getCell(c3).numFmt = HRS_NUM; hrsAlign(tr.getCell(c3), 'center'); }
 
   ws.addRow([]).height = 12;
-  hrsSection(ws, N, 'DETALLE DE ACTIVIDADES');
-  var hr = ws.addRow(['Persona','Día','Fecha','Entrada','Salida','Horas','Actividad']);
+  hrsSection(ws, N, T.secDetail);
+  var hr = ws.addRow([T.person, T.day, T.date, T.start, T.finish, T.hours, T.activity]);
   ws.mergeCells(hr.number,7,hr.number,9);
   hrsHead(hr, N);
   var dFirst = ws.rowCount+1;
   hrsSort(entries, people).forEach(function(h, idx){
     var d = parseISODate(h.date);
-    var r = ws.addRow([hrsPerson(h,people), DAY_NAMES[(d.getDay()+6)%7], hrsXlDate(h.date), h.start||'—', h.finish||'Manual', h.hours||0, h.activity||'']);
+    var r = ws.addRow([hrsPerson(h,people), T.days[(d.getDay()+6)%7], hrsXlDate(h.date), h.start||'—', h.finish||T.manual, h.hours||0, h.activity||'']);
     ws.mergeCells(r.number,7,r.number,9);
     r.height = hrsActivityHeight(h.activity, 35);
     hrsBody(r, N, idx%2===1);
     hrsAlign(r.getCell(1), 'left', { indent:1 });
     for(var c=2;c<=6;c++) hrsAlign(r.getCell(c), 'center');
-    r.getCell(3).numFmt = 'dd/mm/yyyy';
+    r.getCell(3).numFmt = T.dateFmt;
     r.getCell(6).numFmt = HRS_NUM;
     hrsAlign(r.getCell(7), 'left', { wrapText:true, indent:1 });
   });
   var dLast = ws.rowCount;
-  var dt = ws.addRow(['TOTAL DE LA SEMANA','','','','', { formula:'SUM(F'+dFirst+':F'+dLast+')', result: total }]);
+  var dt = ws.addRow([T.weekTotal,'','','','', { formula:'SUM(F'+dFirst+':F'+dLast+')', result: total }]);
   ws.mergeCells(dt.number,1,dt.number,5);
   ws.mergeCells(dt.number,7,dt.number,9);
   hrsTotalRow(dt, N);
@@ -1459,7 +1495,7 @@ function buildHoursWeekBook(project, entries, people, monday){
 }
 
 /* ---------- Archivo 2: acumulado del proyecto ---------- */
-function buildHoursTotalBook(project, entries, people){
+function buildHoursTotalBook(project, entries, people, T){
   var weeks = {};
   entries.forEach(function(h){
     var mon = mondayOf(parseISODate(h.date)), key = toISODate(mon);
@@ -1469,7 +1505,7 @@ function buildHoursTotalBook(project, entries, people){
   var keys = Object.keys(weeks).sort();
   var names = hrsNames(entries, people), total = hrsSum(entries);
   var sorted = hrsSort(entries, people);
-  var periodo = 'del '+hrsLongDate(parseISODate(sorted[0].date))+' al '+hrsLongDate(parseISODate(sorted[sorted.length-1].date));
+  var periodo = T.range(T.longDate(parseISODate(sorted[0].date)), T.longDate(parseISODate(sorted[sorted.length-1].date)));
   var wb = new ExcelJS.Workbook(); wb.creator = 'Viáticos UX'; wb.created = new Date();
 
   /* Hoja 1: resumen por semana */
@@ -1477,16 +1513,16 @@ function buildHoursTotalBook(project, entries, people){
   names.forEach(function(nm){ widths.push(Math.max(12, Math.min(22, nm.length+4))); });
   widths.push(13);
   var N = widths.length;
-  var ws = hrsSheet(wb, 'Resumen semanal', widths);
-  hrsHeader(ws, N, 'REPORTE ACUMULADO DE HORAS', project, [
-    ['Proyecto', project.name],
-    ['Planta / Motivo', hrsPlantReason(project)],
-    ['Periodo', periodo+'   ·   '+keys.length+' semana'+(keys.length===1?'':'s')],
-    ['Personal', names.join(', ')],
-    ['Total de horas', total, true]
+  var ws = hrsSheet(wb, T.sheetSummary, widths, T);
+  hrsHeader(ws, N, T.titleTotal, project, [
+    [T.project, project.name],
+    [T.plantReason, hrsPlantReason(project)],
+    [T.period, periodo+'   ·   '+T.weeks(keys.length)],
+    [T.staff, names.join(', ')],
+    [T.totalHours, total, true]
   ], 2);
-  hrsSection(ws, N, 'RESUMEN POR SEMANA');
-  var hr = ws.addRow(['Semana','Del','Al'].concat(names).concat(['Total']));
+  hrsSection(ws, N, T.secByWeek);
+  var hr = ws.addRow([T.week, T.from, T.to].concat(names).concat([T.total]));
   hrsHead(hr, N);
   var headRow = hr.number, first = headRow+1;
   keys.forEach(function(k, idx){
@@ -1498,13 +1534,13 @@ function buildHoursTotalBook(project, entries, people){
     r.getCell(N).value = { formula:'SUM('+hrsColL(4)+r.number+':'+hrsColL(N-1)+r.number+')', result:t };
     hrsBody(r, N, idx%2===1);
     hrsAlign(r.getCell(1), 'center');
-    r.getCell(2).numFmt = 'dd/mm/yyyy'; r.getCell(3).numFmt = 'dd/mm/yyyy';
+    r.getCell(2).numFmt = T.dateFmt; r.getCell(3).numFmt = T.dateFmt;
     hrsAlign(r.getCell(2), 'center'); hrsAlign(r.getCell(3), 'center');
     for(var c=4;c<=N;c++){ r.getCell(c).numFmt = HRS_NUM; hrsAlign(r.getCell(c), 'center'); }
     r.getCell(N).font = hrsFont({ bold:true });
   });
   var last = ws.rowCount;
-  var gt = ws.addRow(['TOTAL GENERAL']);
+  var gt = ws.addRow([T.grandTotal]);
   ws.mergeCells(gt.number,1,gt.number,3);
   for(var c2=4;c2<=N;c2++){
     var L = hrsColL(c2), res = 0;
@@ -1519,18 +1555,18 @@ function buildHoursTotalBook(project, entries, people){
 
   /* Hoja 2: detalle por semana con subtotales */
   var D = 8;
-  var det = hrsSheet(wb, 'Detalle', [9,12,12,24,10,10,10,44]);
-  hrsHeader(det, D, 'DETALLE ACUMULADO DE HORAS', project, [
-    ['Proyecto', project.name],
-    ['Periodo', periodo],
-    ['Total de horas', total, true]
+  var det = hrsSheet(wb, T.sheetDetail, [9,12,12,24,10,10,10,44], T);
+  hrsHeader(det, D, T.titleDetail, project, [
+    [T.project, project.name],
+    [T.period, periodo],
+    [T.totalHours, total, true]
   ], 2);
-  var dh = det.addRow(['Semana','Día','Fecha','Persona','Entrada','Salida','Horas','Actividad']);
+  var dh = det.addRow([T.week, T.day, T.date, T.person, T.start, T.finish, T.hours, T.activity]);
   hrsHead(dh, D);
   var dHead = dh.number, subCells = [];
   keys.forEach(function(k){
     var wk = weeks[k];
-    var bar = det.addRow(['Semana '+wk.weekNum+'   ·   '+hrsLongDate(wk.monday)+' – '+hrsLongDate(wk.sunday)]);
+    var bar = det.addRow([T.weekN(wk.weekNum)+'   ·   '+T.longDate(wk.monday)+' – '+T.longDate(wk.sunday)]);
     det.mergeCells(bar.number,1,bar.number,D); bar.height = 20;
     var bc = bar.getCell(1);
     bc.font = hrsFont({ bold:true, color:{argb:XLS_NAVY} });
@@ -1540,16 +1576,16 @@ function buildHoursTotalBook(project, entries, people){
     var f = det.rowCount+1;
     hrsSort(wk.entries, people).forEach(function(h, idx){
       var d = parseISODate(h.date);
-      var r = det.addRow([wk.weekNum, DAY_NAMES[(d.getDay()+6)%7], hrsXlDate(h.date), hrsPerson(h,people), h.start||'—', h.finish||'Manual', h.hours||0, h.activity||'']);
+      var r = det.addRow([wk.weekNum, T.days[(d.getDay()+6)%7], hrsXlDate(h.date), hrsPerson(h,people), h.start||'—', h.finish||T.manual, h.hours||0, h.activity||'']);
       r.height = hrsActivityHeight(h.activity, 44);
       hrsBody(r, D, idx%2===1);
       for(var c=1;c<=7;c++) hrsAlign(r.getCell(c), c===4 ? 'left' : 'center', c===4 ? { indent:1 } : null);
-      r.getCell(3).numFmt = 'dd/mm/yyyy';
+      r.getCell(3).numFmt = T.dateFmt;
       r.getCell(7).numFmt = HRS_NUM;
       hrsAlign(r.getCell(8), 'left', { wrapText:true, indent:1 });
     });
     var l = det.rowCount, st = hrsSum(wk.entries);
-    var sr = det.addRow(['Total semana '+wk.weekNum,'','','','','', { formula:'SUM(G'+f+':G'+l+')', result:st }, '']);
+    var sr = det.addRow([T.weekSub(wk.weekNum),'','','','','', { formula:'SUM(G'+f+':G'+l+')', result:st }, '']);
     for(var c4=1;c4<=D;c4++){
       var sc = sr.getCell(c4);
       sc.font = hrsFont({ bold:true, color:{argb:XLS_NAVY} });
@@ -1563,7 +1599,7 @@ function buildHoursTotalBook(project, entries, people){
     subCells.push('G'+sr.number);
     det.addRow([]).height = 6;
   });
-  var dt = det.addRow(['TOTAL GENERAL','','','','','', { formula: subCells.join('+'), result: total }, '']);
+  var dt = det.addRow([T.grandTotal,'','','','','', { formula: subCells.join('+'), result: total }, '']);
   det.mergeCells(dt.number,1,dt.number,6);
   hrsTotalRow(dt, D);
   hrsAlign(dt.getCell(1), 'right', { indent:1 });
@@ -1572,6 +1608,10 @@ function buildHoursTotalBook(project, entries, people){
   det.pageSetup.printTitlesRow = dHead+':'+dHead;
   return wb;
 }
+
+/* Idioma del reporte, recordado por proyecto en este dispositivo. */
+function hrsLangGet(pid){ try{ var v = localStorage.getItem('viaticosux_hrslang_'+pid); return v==='en' ? 'en' : 'es'; }catch(e){ return 'es'; } }
+function hrsLangSet(pid, lang){ try{ localStorage.setItem('viaticosux_hrslang_'+pid, lang); }catch(e){} }
 
 function exportHoursXLSX(project){
   if(typeof ExcelJS==='undefined'){ alertBanner('No se pudo cargar el generador de Excel (revisa tu conexión).'); return; }
@@ -1582,19 +1622,23 @@ function exportHoursXLSX(project){
   var from = toISODate(monday), to = toISODate(sunday);
   var weekEntries = entries.filter(function(h){ return h.date>=from && h.date<=to; });
   var safe = project.name.replace(/[^a-z0-9]+/gi,'_');
+  /* Se preparan ambos idiomas por adelantado: así cada botón de la ventana
+     descarga de inmediato con el toque del usuario (Safari en iPhone y
+     Chrome solo permiten una descarga por toque y la bloquean si se demora). */
   var jobs = [];
-  if(weekEntries.length) jobs.push({ label:'semana '+wk, wb: buildHoursWeekBook(project, weekEntries, people, monday), name: 'Horas_'+safe+'_Semana'+wk+'_'+from+'_al_'+to+'.xlsx' });
-  jobs.push({ label:'acumulado del proyecto', wb: buildHoursTotalBook(project, entries, people), name: 'Horas_'+safe+'_Acumulado_'+todayISO()+'.xlsx' });
-  /* Los navegadores (Safari en iPhone, Chrome) solo permiten UNA descarga por
-     toque: la segunda descarga automática se bloquea. Por eso los archivos se
-     entregan en una ventana con un botón por archivo (cada toque = una
-     descarga) y, si el dispositivo lo permite, "Compartir ambos". */
+  ['es','en'].forEach(function(lang){
+    var T = HRS_TXT[lang];
+    if(weekEntries.length) jobs.push({ lang:lang, kind:'week', wb: buildHoursWeekBook(project, weekEntries, people, monday, T), name: T.fileWeek(safe, wk, from, to) });
+    jobs.push({ lang:lang, kind:'total', wb: buildHoursTotalBook(project, entries, people, T), name: T.fileTotal(safe, todayISO()) });
+  });
   Promise.all(jobs.map(function(j){ return j.wb.xlsx.writeBuffer(); })).then(function(buffers){
-    var files = buffers.map(function(buf, i){
-      return { label: jobs[i].label, name: jobs[i].name,
-        blob: new Blob([buf], { type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }) };
+    var files = { es:[], en:[] };
+    buffers.forEach(function(buf, i){
+      var j = jobs[i];
+      files[j.lang].push({ kind:j.kind, name:j.name,
+        blob: new Blob([buf], { type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }) });
     });
-    openModal('hoursFiles', { files: files, week: wk, weekEmpty: !weekEntries.length, project: project.name });
+    openModal('hoursFiles', { files: files, lang: hrsLangGet(project.id), pid: project.id, week: wk, weekEmpty: !weekEntries.length, project: project.name });
   }).catch(function(err){ console.error(err); alertBanner('No se pudo generar el archivo de Excel.'); });
 }
 function hrsShareFiles(files){
@@ -1604,13 +1648,19 @@ function hrsShareFiles(files){
     return navigator.canShare({ files: list }) ? list : null;
   }catch(e){ return null; }
 }
+function hrsFileLabel(f, week){ return f.kind==='week' ? 'semana '+week : 'acumulado del proyecto'; }
 function modalHoursFiles(opts){
-  var files = opts.files || [];
+  var lang = opts.lang==='en' ? 'en' : 'es';
+  var files = (opts.files && opts.files[lang]) || [];
   var html = '<div class="modal-head"><h2>Reporte de horas listo</h2><button class="modal-close" data-close-modal="1">✕</button></div>';
-  html += '<div class="hint" style="margin:0 0 12px;">'+esc(opts.project||'')+' · Toca cada archivo para descargarlo.</div>';
-  if(opts.weekEmpty) html += '<div class="hint" style="margin:0 0 12px;">La semana '+opts.week+' no tiene horas registradas: solo se generó el acumulado. Para otra semana, cámbiala en Resumen y vuelve a exportar.</div>';
+  html += '<div class="hint" style="margin:0 0 10px;">'+esc(opts.project||'')+' · Elige el idioma y toca cada archivo para descargarlo.</div>';
+  html += '<div class="field" style="margin:0 0 6px;"><label>Idioma del reporte</label><div class="segmented" id="hrsLangSeg">'+
+    '<button type="button" data-hrs-lang="es" class="'+(lang==='es'?'active':'')+'">Español</button>'+
+    '<button type="button" data-hrs-lang="en" class="'+(lang==='en'?'active':'')+'">English</button></div></div>';
+  if(opts.weekEmpty) html += '<div class="hint" style="margin:0 0 8px;">La semana '+opts.week+' no tiene horas registradas: solo se generó el acumulado. Para otra semana, cámbiala en Resumen y vuelve a exportar.</div>';
+  var tag = lang==='en' ? ' (English)' : ' (Español)';
   files.forEach(function(f, i){
-    html += '<button type="button" class="btn block" data-hrs-file="'+i+'" style="margin-top:8px;">Descargar '+esc(f.label)+'</button>';
+    html += '<button type="button" class="btn block" data-hrs-file="'+i+'" style="margin-top:8px;">Descargar '+esc(hrsFileLabel(f, opts.week))+tag+'</button>';
     html += '<div class="hint" style="margin:4px 0 0;word-break:break-all;">'+esc(f.name)+'</div>';
   });
   if(files.length>1 && hrsShareFiles(files)) html += '<button type="button" class="btn block ghost" id="hrsShareBtn" style="margin-top:14px;">Compartir ambos (correo, Archivos…)</button>';
@@ -2903,20 +2953,30 @@ function bindModalEvents(name, opts){
     });
   }
   else if(name==='hoursFiles'){
+    var hLang = opts.lang==='en' ? 'en' : 'es';
+    var hFiles = (opts.files && opts.files[hLang]) || [];
+    sheet.querySelectorAll('[data-hrs-lang]').forEach(function(b){
+      b.addEventListener('click', function(){
+        var l = b.getAttribute('data-hrs-lang');
+        if(l===hLang) return;
+        hrsLangSet(opts.pid, l);
+        openModal('hoursFiles', Object.assign({}, opts, { lang:l }));
+      });
+    });
     sheet.querySelectorAll('[data-hrs-file]').forEach(function(b){
       b.addEventListener('click', function(){
-        var f = opts.files[parseInt(b.getAttribute('data-hrs-file'),10)];
+        var f = hFiles[parseInt(b.getAttribute('data-hrs-file'),10)];
         if(!f) return;
         downloadBlobFile(f.blob, f.name);
-        b.textContent = '✓ Descargado: '+f.label+' (toca para repetir)';
+        b.textContent = '✓ Descargado: '+hrsFileLabel(f, opts.week)+' (toca para repetir)';
       });
     });
     var shareBtn = document.getElementById('hrsShareBtn');
     if(shareBtn){
       shareBtn.addEventListener('click', function(){
-        var list = hrsShareFiles(opts.files);
+        var list = hrsShareFiles(hFiles);
         if(!list){ alertBanner('Este dispositivo no permite compartir archivos; descárgalos uno por uno.'); return; }
-        navigator.share({ files: list, title: 'Reporte de horas · '+(opts.project||'') }).catch(function(err){
+        navigator.share({ files: list, title: (hLang==='en' ? 'Hours report · ' : 'Reporte de horas · ')+(opts.project||'') }).catch(function(err){
           if(err && err.name!=='AbortError'){ console.error(err); alertBanner('No se pudo compartir; descarga los archivos uno por uno.'); }
         });
       });
